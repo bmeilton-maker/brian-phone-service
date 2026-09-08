@@ -1,0 +1,17 @@
+{
+  "recipient_name": "Riverside Dental",
+  "phone_number": "+16145550100",
+  "objective": "Schedule a routine dental cleaning for Brian within the next two weeks. Mornings preferred. If nothing in two weeks, take the earliest morning after that.",
+  "relevant_context": {
+    "patient_name": "Brian Meilton",
+    "existing_patient": true,
+    "last_visit": "about six months ago",
+    "insurance_on_file": true
+  },
+  "preferences": { "time_of_day": "mornings, 8 to 11 AM", "avoid": "Fridays" },
+  "authority": { "may_schedule": true, "may_reschedule": true, "may_disclose": ["date of birth"] },
+  "required_outputs": ["appointment date", "appointment time", "confirmation number", "anything Brian needs to bring"],
+  "opening_instruction": "Confirm you've reached Riverside Dental's scheduling desk before stating the purpose.",
+  "max_duration_seconds": 600,
+  "idempotency_key": "dental-cleaning-2026-09"
+}

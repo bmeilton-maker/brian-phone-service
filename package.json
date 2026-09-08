@@ -1,0 +1,28 @@
+{
+  "name": "brian-phone-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Outbound phone-calling service for Brian's AI chief of staff (Grok/Ring). Provider-abstracted: Bland (default) and xAI Grok Voice.",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start:http": "tsx src/server/http.ts",
+    "start:mcp": "tsx src/server/mcp.ts",
+    "demo": "tsx src/cli/demo.ts",
+    "test": "LOG_LEVEL=error tsx --test test/*.test.ts",
+    "test:live": "PHONE_LIVE_TESTS=1 tsx --test test/live/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "ws": "^8.21.3",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.23.13",
+    "typescript": "^5.7.0"
+  }
+}

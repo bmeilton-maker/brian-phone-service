@@ -1,0 +1,26 @@
+{
+  "objective": "Schedule a routine dental cleaning for Brian within the next two weeks. Mornings preferred. If nothing in two weeks, take the earliest morning after that.",
+  "identity": { "owner_name": "Brian", "role": "Brian's AI/personal assistant" },
+  "relevant_context": {
+    "patient_name": "Brian Meilton",
+    "existing_patient": true,
+    "last_visit": "about six months ago",
+    "insurance_on_file": true
+  },
+  "preferences": {
+    "time_of_day": "mornings, 8 to 11 AM",
+    "avoid": "Fridays",
+    "hygienist": "no preference"
+  },
+  "authority": {
+    "may_schedule": true,
+    "may_reschedule": true,
+    "may_cancel": false,
+    "may_accept_terms": false,
+    "may_authorize_amount_up_to": null,
+    "may_authorize_repairs": false,
+    "may_provide_payment_card": false,
+    "may_disclose": ["date of birth"]
+  },
+  "required_outputs": ["appointment date", "appointment time", "confirmation number", "anything Brian needs to bring"]
+}

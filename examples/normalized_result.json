@@ -1,0 +1,24 @@
+{
+  "task_id": "task_3e3e61e5-7408-447c-94f3-f8200927d1e4",
+  "status": "success",
+  "summary": "Booked a dental cleaning at Riverside Dental for Tuesday, September 15 at 10:00 AM. Confirmation DC-48213. Bring your insurance card.",
+  "human_or_business_reached": "Riverside Dental scheduling desk (Maria)",
+  "results": {
+    "appointment date": "Tuesday, September 15",
+    "appointment time": "10:00 AM",
+    "confirmation number": "DC-48213",
+    "anything Brian needs to bring": "insurance card"
+  },
+  "commitments_made": ["Dental cleaning Tuesday Sept 15, 10:00 AM"],
+  "financial_commitments": [],
+  "dates_and_times": ["Tuesday, September 15, 10:00 AM"],
+  "confirmation_numbers": ["DC-48213"],
+  "follow_up_required": false,
+  "follow_up": null,
+  "questions_for_brian": [],
+  "duration_seconds": 140,
+  "transcript": "assistant: Hi, this is Brian's AI assistant...\nhuman: ...",
+  "recording_reference": "https://.../recording.mp3",
+  "provider": "bland",
+  "raw_provider_result": { "provider": "bland", "call_id": "..." }
+}
