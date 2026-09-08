@@ -31,5 +31,5 @@ Do these in order. Bland-only operation needs only step 1.
 - [ ] Open `data/calls/<task_id>.json` and confirm transcript + result
 
 ## Ring / Grok side
-- [ ] Add the MCP server (`npm run start:mcp` in `phone-service/`) as `phone`
+- [ ] Add the MCP server (`npm run start:mcp` from the repo root) as `phone`
 - [ ] Give the chief-of-staff prompt the envelope rules from README "Call envelope" and the poll loop from "How Grok / Ring calls it"

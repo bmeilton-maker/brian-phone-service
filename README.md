@@ -19,7 +19,6 @@ Grok Chief of Staff -> phone MCP tools -> PhoneService -> { BlandProvider | XaiP
 ## Quick start
 
 ```bash
-cd phone-service
 cp .env.example .env         # fill in BLAND_API_KEY at minimum
 npm install
 npm test                     # mocked regression suite (31 tests)
@@ -34,7 +33,7 @@ npm run start:http           # HTTP API + webhooks on :8787
 
 ### MCP (stdio)
 
-Register `node --import tsx phone-service/src/server/mcp.ts` (or `npm run start:mcp` from `phone-service/`) as an MCP server named `phone`.
+Register `npm run start:mcp` from the repo root as an MCP server named `phone`.
 Tools (provider-independent):
 
 | Tool | Purpose |
