@@ -84,7 +84,9 @@ Extraction order: provider structured outcome (xAI `report_outcome` tool call) >
 | `XAI_REALTIME_MODEL` | `grok-voice-latest` | Realtime model alias. |
 | `XAI_EXTRACTION_MODEL` | `grok-4-fast` | Text model for transcript -> result. |
 | `XAI_SIP_NUMBER`, `XAI_WEBHOOK_SECRET` | | From registering a Direct SIP number (see docs/PROVISIONING.md). |
-| `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` | | Dials the PSTN leg for xai. |
+| `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` | | Dials for xai (SIP leg first, then the human). |
+| `TWILIO_VALIDATE_SIGNATURE` | `true` | Verify `X-Twilio-Signature` on webhooks. Rejections are logged as `twilio.webhook.rejected` with the expected URL. |
+| `TWILIO_RECONCILE_AFTER_MS` | `45000` | If no Twilio callback arrives for this long, `get_status` asks Twilio directly. |
 | `PUBLIC_BASE_URL` | | Public HTTPS URL of this service; needed for xAI and Twilio webhooks. |
 | `PHONE_SERVICE_TOKEN` | | Bearer token for the HTTP API. |
 | `DATA_DIR` | `./data` | Call records (`data/calls/<task_id>.json`). |
@@ -110,13 +112,13 @@ Bland cannot hold the line for a live answer, so `needs_user` on Bland always me
 
 `src/providers/xai/`. Full runbook with what is verified vs. still to confirm: **docs/XAI_RUNBOOK.md**.
 
-Outbound path (xAI SIP is inbound-first; there is no documented "dial this PSTN number" API, so Twilio dials):
+Outbound path (xAI SIP is inbound-first; there is no documented "dial this PSTN number" API, so Twilio dials). SIP-first ordering so the callee never hears ringback:
 
-1. `TwilioClient.dial` -> `POST /2010-04-01/Accounts/{sid}/Calls.json` with TwiML `<Dial answerOnBridge="true"><Sip>sip:{XAI_SIP_NUMBER}@sip.voice.x.ai;transport=tls?X-Task-Id=…</Sip></Dial>`, status callbacks, async AMD (voicemail detection).
-2. xAI receives the bridged SIP leg and POSTs `realtime.call.incoming` to `PUBLIC_BASE_URL/webhooks/xai` (signature verified).
-3. `XaiProvider.handleXaiIncoming` matches the pending task, opens `wss://api.x.ai/v1/realtime?call_id=…`, sends `session.update` (voice, instructions from the envelope, `server_vad`, tools) and `response.create`.
-4. The agent talks; transcripts stream in; tool calls are dispatched (`report_outcome` becomes the structured base of the result; `end_call` hangs up via Twilio; `ask_owner` holds for Brian).
-5. Twilio `completed` callback (or timeout safety net) finalizes; `PhoneService` runs extraction and persists.
+1. `TwilioClient.dial` -> `POST /2010-04-01/Accounts/{sid}/Calls.json` with `To=sip:{XAI_SIP_NUMBER}@sip.voice.x.ai;transport=tls?X-Task-Id=…` (parent leg). xAI answers immediately.
+2. xAI POSTs `realtime.call.incoming` to `PUBLIC_BASE_URL/webhooks/xai` (signature verified). `XaiProvider.handleXaiIncoming` matches the pending task, opens `wss://api.x.ai/v1/realtime?call_id=…`, sends `session.update` (voice, instructions from the envelope, `server_vad`, tools). The greeting is held.
+3. TwiML on the answered SIP leg runs `<Dial><Number statusCallback=… machineDetection="Enable">{callee}</Number></Dial>` (child leg). The callee is dialed from a live line and is bridged to the agent the moment they pick up.
+4. Child-leg `in-progress` callback releases `response.create`; the agent greets. Transcripts stream in; tool calls are dispatched (`report_outcome` becomes the structured base of the result; `end_call` hangs up via Twilio and finalizes locally; `ask_owner` holds for Brian).
+5. Child-leg `completed` (with Twilio's `CallDuration`), the parent `completed`, a closed socket, or a quiet-callback reconcile against Twilio finalizes; `PhoneService` runs extraction and persists. `duration_seconds` is talk time only (human answered to ended).
 
 ## Migration plan (Bland -> xAI)
 

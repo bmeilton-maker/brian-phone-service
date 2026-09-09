@@ -46,6 +46,10 @@ export const config = {
     accountSid: env("TWILIO_ACCOUNT_SID"),
     authToken: env("TWILIO_AUTH_TOKEN"),
     fromNumber: env("TWILIO_FROM_NUMBER"),
+    /** Set TWILIO_VALIDATE_SIGNATURE=false only for local debugging behind a tunnel that rewrites URLs. */
+    validateSignature: env("TWILIO_VALIDATE_SIGNATURE", "true").toLowerCase() !== "false",
+    /** Reconcile against Twilio if no status callback has arrived for this long (ms). */
+    reconcileAfterMs: num("TWILIO_RECONCILE_AFTER_MS", 45_000),
   },
 };
 

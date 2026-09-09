@@ -8,20 +8,28 @@ import { XaiRealtimeSession, TOOL_NAMES, type WsLike } from "./realtime.js";
 /**
  * XaiProvider: outbound via Twilio -> xAI Direct SIP -> realtime session.
  *
- *  1. startCall: Twilio dials the recipient; TwiML bridges the answered leg to sip:{XAI_SIP_NUMBER}@sip.voice.x.ai.
- *  2. xAI POSTs `realtime.call.incoming` to PUBLIC_BASE_URL/webhooks/xai (signed). We correlate it to the
- *     pending task (X-Task-Id SIP header if surfaced, else the oldest pending dial) and open
- *     wss://api.x.ai/v1/realtime?call_id=... with the envelope as session.instructions.
- *  3. Twilio status callbacks mark ringing/answered/completed; AMD callback marks voicemail.
- *  4. The agent calls report_outcome / ask_owner / end_call tools; end_call hangs up via Twilio.
+ *  1. startCall: Twilio dials xAI's Direct SIP number first (parent leg). xAI answers at once and POSTs
+ *     `realtime.call.incoming` to PUBLIC_BASE_URL/webhooks/xai (signed). We correlate it to the pending task
+ *     (X-Task-Id SIP header if surfaced, else the oldest pending dial) and open wss://api.x.ai/v1/realtime?call_id=...
+ *     with the envelope as session.instructions. The agent's greeting is HELD.
+ *  2. TwiML on that answered leg <Dial>s the human (child PSTN leg). Because the line is already live, the
+ *     callee is bridged to the agent the instant they pick up; no ringback is played to them.
+ *  3. Child-leg status callbacks (ParentCallSid = our call_id) drive ringing/answered/completed; the greeting is
+ *     released on "in-progress". AMD on the child leg marks voicemail.
+ *  4. The agent calls report_outcome / ask_owner / end_call; end_call hangs up via Twilio AND finalizes locally,
+ *     so a lost callback cannot leave the call stuck in_progress. Socket close and getOutcome() also reconcile
+ *     against Twilio when callbacks go quiet.
  *
  * State lives in memory (one process) plus the CallStore's event log written by PhoneService.
  */
 
 interface XaiCall {
   task_id: string;
-  twilio_sid: string;
+  twilio_sid: string; // parent (xAI SIP) leg; our call_id
+  pstn_sid: string | null; // child (human) leg
   xai_call_id: string | null;
+  last_status_at: number;
+  reconciling: boolean;
   input: StartCallInput;
   state: CallState;
   started_at: number;
@@ -70,33 +78,69 @@ export class XaiProvider implements PhoneProvider {
     if (missing.length) throw new Error(`xai provider not configured: missing ${missing.join(", ")}`);
     const { sid, raw } = await this.twilio.dial({ to: input.phone_number, taskId: input.task_id, maxDurationSeconds: input.max_duration_seconds, publicBaseUrl: config.publicBaseUrl });
     this.calls.set(sid, {
-      task_id: input.task_id, twilio_sid: sid, xai_call_id: null, input, state: "dialing", started_at: this.now(), answered_at: null, ended_at: null,
+      task_id: input.task_id, twilio_sid: sid, pstn_sid: null, xai_call_id: null, last_status_at: this.now(), reconciling: false, input, state: "dialing", started_at: this.now(), answered_at: null, ended_at: null,
       human_answered: null, voicemail: null, error: null, session: null, turns: [], outcome: null, pendingQuestion: null, raw: { provider: "xai", twilio: raw },
     });
     return { call_id: sid, state: "dialing", raw };
   }
 
-  /** Twilio status callback (form-encoded): CallSid, CallStatus, CallDuration, AnsweredBy... */
+  /**
+   * Twilio status callback (form-encoded). Two legs report here:
+   *   parent (CallSid === twilio_sid): the xAI SIP leg. "in-progress" = xAI answered; "completed" = whole call over.
+   *   child  (ParentCallSid === twilio_sid): the human PSTN leg. This is the leg that defines answered/busy/no-answer
+   *   and the true talk duration (CallDuration).
+   */
   handleTwilioStatus(form: Record<string, string>): void {
-    const c = this.calls.get(form.CallSid ?? "");
-    if (!c) { log.warn("twilio.status.unknown_sid", { sid: form.CallSid }); return; }
+    const sid = form.CallSid ?? "";
+    const parentSid = form.ParentCallSid ?? "";
+    const c = this.calls.get(sid) ?? this.calls.get(parentSid) ?? [...this.calls.values()].find((x) => x.pstn_sid === sid);
+    if (!c) { log.warn("twilio.status.unknown_sid", { sid, parent: parentSid }); return; }
+    const isChild = sid !== c.twilio_sid;
+    if (isChild && !c.pstn_sid) c.pstn_sid = sid;
+    c.last_status_at = this.now();
     const s = form.CallStatus;
-    log.info("twilio.status", { task_id: c.task_id, sid: c.twilio_sid, status: s });
-    if (s === "ringing") c.state = c.state === "dialing" ? "ringing" : c.state;
-    else if (s === "in-progress" || s === "answered") { c.state = c.state === "needs_user" ? c.state : "in_progress"; c.answered_at ??= this.now(); c.human_answered ??= true; }
-    else if (s === "busy") this.end(c, "failed", "busy");
-    else if (s === "no-answer") this.end(c, "failed", "no_answer");
-    else if (s === "failed" || s === "canceled") this.end(c, s === "canceled" ? "cancelled" : "failed", form.ErrorMessage ?? s);
-    else if (s === "completed") {
-      if (form.CallDuration) c.raw.twilio_duration = Number(form.CallDuration);
-      this.end(c, c.state === "failed" ? "failed" : "completed", c.error);
+    log.info("twilio.status", { task_id: c.task_id, leg: isChild ? "pstn" : "xai_sip", sid, status: s, duration: form.CallDuration });
+    // Always capture Twilio's measured durations, even on late callbacks after we finalized locally.
+    if (s === "completed" && form.CallDuration) c.raw[isChild ? "pstn_duration" : "twilio_duration"] = Number(form.CallDuration);
+    if (c.ended_at) return;
+
+    if (isChild) {
+      if (s === "initiated") c.state = c.state === "dialing" ? "dialing" : c.state;
+      else if (s === "ringing") { if (c.state === "dialing") c.state = "ringing"; }
+      else if (s === "in-progress" || s === "answered") this.markAnswered(c);
+      else if (s === "busy") this.end(c, "failed", "busy");
+      else if (s === "no-answer") this.end(c, "failed", "no_answer");
+      else if (s === "failed") this.end(c, "failed", form.ErrorMessage ?? "failed");
+      else if (s === "canceled") this.end(c, "cancelled", "cancelled");
+      else if (s === "completed") {
+        if (!c.answered_at) this.end(c, "failed", "no_answer");
+        else this.end(c, "completed", null);
+      }
+      return;
     }
+    // parent (xAI SIP leg)
+    if (s === "in-progress" || s === "answered") c.raw.sip_answered_at = new Date(this.now()).toISOString();
+    else if (s === "busy" || s === "no-answer" || s === "failed") this.end(c, "failed", `xai_sip_${s}`);
+    else if (s === "canceled") this.end(c, "cancelled", "cancelled");
+    else if (s === "completed") {
+      if (!c.answered_at && c.turns.every((t) => t.speaker !== "human")) this.end(c, "failed", c.error ?? "no_answer");
+      else this.end(c, "completed", c.error);
+    }
+  }
+
+  private markAnswered(c: XaiCall) {
+    if (!c.answered_at) c.answered_at = this.now();
+    c.human_answered ??= true;
+    if (c.state !== "needs_user") c.state = "in_progress";
+    c.session?.startConversation();
   }
 
   /** Twilio async AMD callback: AnsweredBy = human | machine_start | machine_end_beep | machine_end_silence | machine_end_other | fax | unknown */
   handleTwilioAmd(form: Record<string, string>): void {
-    const c = this.calls.get(form.CallSid ?? "");
+    const sid = form.CallSid ?? "";
+    const c = this.calls.get(sid) ?? [...this.calls.values()].find((x) => x.pstn_sid === sid);
     if (!c) return;
+    if (!c.pstn_sid && sid !== c.twilio_sid) c.pstn_sid = sid;
     const by = form.AnsweredBy ?? "unknown";
     c.raw.answered_by = by;
     if (by.startsWith("machine")) { c.voicemail = true; c.human_answered = false; }
@@ -120,9 +164,17 @@ export class XaiProvider implements PhoneProvider {
     const session = new XaiRealtimeSession({
       call_id: xaiCallId, instructions, voice: c.input.preferred_voice ?? config.xai.voice, ownerName: c.input.envelope.identity.owner_name,
       wsFactory: this.deps.wsFactory,
+      // Hold the opening line until the human leg answers; release in markAnswered().
+      deferGreeting: !c.answered_at,
       hooks: {
         onAskOwner: (question, options) => this.holdForOwner(c, question, options),
-        onEndCall: async (reason) => { c.raw.end_reason = reason; await this.twilio.hangup(c.twilio_sid).catch((e) => log.warn("twilio.hangup_failed", { error: String(e) })); },
+        onEndCall: async (reason) => {
+          c.raw.end_reason = reason;
+          await this.twilio.hangup(c.twilio_sid).catch((e) => log.warn("twilio.hangup_failed", { error: String(e) }));
+          // Finalize now; the call state is "completed" (the agent chose to end it). The RESULT status
+          // (success/partial/failed/needs_user) comes from report_outcome + extraction, not from here.
+          this.end(c, "completed", null);
+        },
         onSendDtmf: async (digits) => {
           // VERIFY: DTMF injection on a Twilio<->xAI SIP bridge. Not available from the realtime socket today;
           // the agent is instructed to ask for a representative when this returns ok:false.
@@ -133,12 +185,18 @@ export class XaiProvider implements PhoneProvider {
     });
     session.on("turn", (t: TranscriptTurn) => c.turns.push(t));
     session.on("outcome", (o: Record<string, unknown>) => { c.outcome = o; });
-    session.on("closed", () => { if (!c.ended_at) log.info("xai.realtime.closed_before_twilio_end", { task_id: c.task_id }); });
+    session.on("closed", () => {
+      if (c.ended_at) return;
+      log.info("xai.realtime.closed_before_twilio_end", { task_id: c.task_id });
+      // xAI dropped the socket (their side hung up or the SIP leg ended). Reconcile with Twilio instead of waiting.
+      void this.reconcile(c);
+    });
     session.on("error", (e: Error) => { c.raw.realtime_error = String(e); });
     c.session = session;
-    c.state = "in_progress";
-    c.answered_at ??= this.now();
+    // The SIP leg is live but the human is not on yet (unless the child leg already reported answered).
+    if (c.answered_at) c.state = c.state === "needs_user" ? c.state : "in_progress";
     session.connect();
+    if (c.answered_at) session.startConversation();
     log.info("xai.session_attached", { task_id: c.task_id, xai_call_id: xaiCallId });
     return { attached: true, task_id: c.task_id };
   }
@@ -181,28 +239,47 @@ export class XaiProvider implements PhoneProvider {
     log.info("xai.call_ended", { task_id: c.task_id, state, error });
   }
 
+  /** Ask Twilio for the parent leg's real state when callbacks have gone quiet or the socket closed. */
+  private async reconcile(c: XaiCall): Promise<void> {
+    if (c.ended_at || c.reconciling) return;
+    c.reconciling = true;
+    try {
+      const t = await this.twilio.fetch(c.twilio_sid).catch(() => null);
+      const status = String(t?.status ?? "");
+      log.info("twilio.reconcile", { task_id: c.task_id, sid: c.twilio_sid, status });
+      if (["completed", "failed", "busy", "no-answer", "canceled"].includes(status)) {
+        this.handleTwilioStatus({ CallSid: c.twilio_sid, CallStatus: status, CallDuration: String(t?.duration ?? "") });
+      } else if (!t && this.now() - c.started_at > (c.input.max_duration_seconds + 60) * 1000) {
+        this.end(c, "failed", "provider_timeout");
+      }
+    } finally {
+      c.reconciling = false;
+    }
+  }
+
   async getOutcome(call_id: string): Promise<ProviderCallOutcome> {
     const c = this.calls.get(call_id);
     if (!c) throw new Error(`xai: unknown call ${call_id}`);
-    // Safety net: if the Twilio 'completed' callback never arrives, poll Twilio once the max duration has passed.
-    if (!c.ended_at && this.now() - c.started_at > (c.input.max_duration_seconds + 60) * 1000) {
-      const t = await this.twilio.fetch(c.twilio_sid).catch(() => null);
-      if (t && ["completed", "failed", "busy", "no-answer", "canceled"].includes(String(t.status))) this.handleTwilioStatus({ CallSid: c.twilio_sid, CallStatus: String(t.status), CallDuration: String(t.duration ?? "") });
-      else this.end(c, "failed", "provider_timeout");
+    if (!c.ended_at) {
+      const quiet = this.now() - c.last_status_at > config.twilio.reconcileAfterMs;
+      const overMax = this.now() - c.started_at > (c.input.max_duration_seconds + 60) * 1000;
+      if (c.session?.closed || quiet || overMax) await this.reconcile(c);
     }
     const ended = !!c.ended_at;
-    const duration = c.answered_at ? Math.round(((c.ended_at ?? this.now()) - c.answered_at) / 1000) : null;
+    // Talk time only: PSTN answered -> ended. Prefer Twilio's own child-leg duration when it reported one.
+    const pstnDuration = typeof c.raw.pstn_duration === "number" ? (c.raw.pstn_duration as number) : null;
+    const duration = ended && pstnDuration != null ? pstnDuration : c.answered_at ? Math.round(((c.ended_at ?? this.now()) - c.answered_at) / 1000) : null;
     const transcript = c.turns.map((t) => `${t.speaker}: ${t.text}`).join("\n");
     return {
       call_id, ended, state: c.state,
       human_answered: ended ? (c.human_answered ?? (c.turns.some((t) => t.speaker === "human") ? true : false)) : c.human_answered,
       voicemail: ended ? (c.voicemail ?? false) : c.voicemail,
       duration_seconds: duration, transcript, transcript_turns: c.turns,
-      recording_reference: null, // Twilio call recording not enabled on the bridge leg by default; see runbook.
+      recording_reference: null, // Twilio call recording not enabled by default; see runbook.
       error: c.error ?? (ended && c.turns.length === 0 && !c.voicemail ? "no_transcript" : null),
       cost_usd: null,
       provider_extraction: c.outcome ? (c.outcome as ProviderCallOutcome["provider_extraction"]) : null,
-      raw: { ...c.raw, provider: "xai", xai_call_id: c.xai_call_id, twilio_sid: c.twilio_sid, pending_question: c.pendingQuestion ? { id: c.pendingQuestion.id, question: c.pendingQuestion.question, options: c.pendingQuestion.options, asked_at: c.pendingQuestion.asked_at } : null },
+      raw: { ...c.raw, provider: "xai", xai_call_id: c.xai_call_id, twilio_sid: c.twilio_sid, pstn_sid: c.pstn_sid, answered_at: c.answered_at ? new Date(c.answered_at).toISOString() : null, ended_at: c.ended_at ? new Date(c.ended_at).toISOString() : null, pending_question: c.pendingQuestion ? { id: c.pendingQuestion.id, question: c.pendingQuestion.question, options: c.pendingQuestion.options, asked_at: c.pendingQuestion.asked_at } : null },
     };
   }
 

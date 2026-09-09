@@ -69,7 +69,11 @@ async function handleWebhook(path: string, req: IncomingMessage, raw: string, xa
   }
   const form = Object.fromEntries(new URLSearchParams(raw));
   // Twilio signs with X-Twilio-Signature; validation requires the exact public URL. Enabled when PUBLIC_BASE_URL is set.
-  if (config.twilio.authToken && config.publicBaseUrl && !verifyTwilioSignature(req, path, form)) return json(res, 401, { error: "bad twilio signature" });
+  if (config.twilio.validateSignature && config.twilio.authToken && config.publicBaseUrl && !verifyTwilioSignature(req, path, form)) {
+    log.warn("twilio.webhook.rejected", { path, call_sid: form.CallSid, status: form.CallStatus, expected_url: `${config.publicBaseUrl}${path}`, hint: "PUBLIC_BASE_URL must match the exact URL Twilio calls (scheme, host, no port rewrite). Set TWILIO_VALIDATE_SIGNATURE=false to bypass while debugging." });
+    return json(res, 401, { error: "bad twilio signature" });
+  }
+  log.debug("twilio.webhook", { path, call_sid: form.CallSid, parent: form.ParentCallSid, status: form.CallStatus, answered_by: form.AnsweredBy });
   if (path === "/webhooks/twilio/status") { xai.handleTwilioStatus(form); return json(res, 200, { ok: true }); }
   if (path === "/webhooks/twilio/amd") { xai.handleTwilioAmd(form); return json(res, 200, { ok: true }); }
   return json(res, 404, { error: "not found" });

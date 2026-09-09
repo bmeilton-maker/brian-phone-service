@@ -10,7 +10,7 @@ import type { TranscriptTurn } from "../../types.js";
  * One xAI realtime session attached to a SIP call.
  *   wss://api.x.ai/v1/realtime?call_id={call_id}   Authorization: Bearer XAI_API_KEY
  *   -> session.update { voice, instructions, turn_detection, tools }
- *   -> response.create (agent speaks first)
+ *   -> response.create (agent speaks first; deferred until the PSTN leg answers when deferGreeting is set)
  * Verified event names (docs + reference clients): session.created, session.updated, conversation.created,
  *   input_audio_buffer.speech_started/stopped, conversation.item.input_audio_transcription.completed,
  *   response.output_audio_transcript.delta/done, response.done, error.
@@ -60,8 +60,23 @@ export class XaiRealtimeSession extends EventEmitter {
   private handledCalls = new Set<string>();
 
   constructor(
-    private opts: { call_id: string; instructions: string; voice: string; ownerName: string; hooks: RealtimeHooks; wsFactory?: (url: string, headers: Record<string, string>) => WsLike },
+    private opts: { call_id: string; instructions: string; voice: string; ownerName: string; hooks: RealtimeHooks; wsFactory?: (url: string, headers: Record<string, string>) => WsLike; deferGreeting?: boolean },
   ) { super(); }
+
+  private open = false;
+  private greeted = false;
+  closed = false;
+
+  /**
+   * Trigger the agent's opening line. With deferGreeting the provider calls this once the human leg is
+   * actually answered, so the agent does not talk into ringback. Safe to call before open (queued) or twice (no-op).
+   */
+  startConversation(): void {
+    if (this.greeted) return;
+    if (!this.open) { this.opts.deferGreeting = false; return; }
+    this.greeted = true;
+    this.send({ type: "response.create", metadata: { client_event_id: randomUUID() } });
+  }
 
   connect(): void {
     const url = `${config.xai.realtimeUrl}?call_id=${encodeURIComponent(this.opts.call_id)}`;
@@ -81,11 +96,12 @@ export class XaiRealtimeSession extends EventEmitter {
           tool_choice: "auto",
         },
       });
-      // Agent speaks first (we're the caller).
-      this.send({ type: "response.create", metadata: { client_event_id: randomUUID() } });
+      this.open = true;
+      // Agent speaks first (we're the caller), unless the provider is holding the greeting for the human leg to answer.
+      if (!this.opts.deferGreeting) this.startConversation();
     });
     this.ws.on("message", (data: unknown) => this.handle(String(data)));
-    this.ws.on("close", (code: number, reason: unknown) => this.emit("closed", { code, reason: String(reason ?? "") }));
+    this.ws.on("close", (code: number, reason: unknown) => { this.closed = true; this.emit("closed", { code, reason: String(reason ?? "") }); });
     this.ws.on("error", (e: Error) => { log.error("xai.realtime.error", { error: String(e) }); this.emit("error", e); });
   }
 
