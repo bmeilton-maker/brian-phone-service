@@ -60,20 +60,50 @@ export class XaiRealtimeSession extends EventEmitter {
   private handledCalls = new Set<string>();
 
   constructor(
-    private opts: { call_id: string; instructions: string; voice: string; ownerName: string; hooks: RealtimeHooks; wsFactory?: (url: string, headers: Record<string, string>) => WsLike; deferGreeting?: boolean },
+    private opts: { call_id: string; instructions: string; voice: string; ownerName: string; hooks: RealtimeHooks; wsFactory?: (url: string, headers: Record<string, string>) => WsLike; deferGreeting?: boolean; greetingWaitMs?: number; autoResponseGraceMs?: number },
   ) { super(); }
 
   private open = false;
   private greeted = false;
+  private answered = false;
+  private humanSpoke = false;
+  private responding = false;
+  private greetingTimer: NodeJS.Timeout | null = null;
+  private graceTimer: NodeJS.Timeout | null = null;
   closed = false;
 
   /**
-   * Trigger the agent's opening line. With deferGreeting the provider calls this once the human leg is
-   * actually answered, so the agent does not talk into ringback. Safe to call before open (queued) or twice (no-op).
+   * Greeting policy (Brian's locked preference): the agent never speaks on bare pickup.
+   *   1. onHumanAnswered(): arm a wait of greetingWaitMs. Silence from the agent.
+   *   2. Human speaks (speech_stopped or transcript): xAI's server VAD normally auto-responds. We give it
+   *      autoResponseGraceMs; if no response has started by then, we nudge with response.create.
+   *   3. Nobody speaks for greetingWaitMs (silent pickup, IVR already talking, etc.): open anyway.
+   * ask_owner / tool outputs still use response.create directly (those are mid-conversation continuations).
    */
-  startConversation(): void {
-    if (this.greeted) return;
-    if (!this.open) { this.opts.deferGreeting = false; return; }
+  onHumanAnswered(): void {
+    if (this.answered) return;
+    this.answered = true;
+    if (!this.open) { this.opts.deferGreeting = false; return; } // connect() will call this again on open
+    if (this.humanSpoke) { this.ensureResponse(); return; }
+    this.greetingTimer = setTimeout(() => { this.greetingTimer = null; if (!this.greeted) { this.emit("greeting_fallback"); this.ensureResponse(); } }, this.opts.greetingWaitMs ?? 3000);
+    this.greetingTimer.unref?.();
+  }
+
+  /** Back-compat alias: immediate greeting. Only used when the human is already talking or by explicit callers. */
+  startConversation(): void { this.onHumanAnswered(); }
+
+  private onHumanSpeech(): void {
+    if (!this.answered) return; // pre-answer noise on the SIP leg (ringback/IVR) is not a greeting
+    if (this.humanSpoke) return;
+    this.humanSpoke = true;
+    if (this.greetingTimer) { clearTimeout(this.greetingTimer); this.greetingTimer = null; }
+    // Let server VAD auto-respond first; nudge only if it does not.
+    this.graceTimer = setTimeout(() => { this.graceTimer = null; if (!this.responding && !this.greeted) this.ensureResponse(); }, this.opts.autoResponseGraceMs ?? 800);
+    this.graceTimer.unref?.();
+  }
+
+  private ensureResponse(): void {
+    if (this.greeted || !this.open) return;
     this.greeted = true;
     this.send({ type: "response.create", metadata: { client_event_id: randomUUID() } });
   }
@@ -91,21 +121,31 @@ export class XaiRealtimeSession extends EventEmitter {
           model: config.xai.realtimeModel,
           voice: this.opts.voice,
           instructions: this.opts.instructions,
-          turn_detection: { type: "server_vad" },
+          // VERIFY field names against xAI Voice Agent docs (OpenAI-Realtime-compatible naming assumed).
+          turn_detection: {
+            type: "server_vad",
+            threshold: config.xai.vadThreshold,
+            prefix_padding_ms: config.xai.vadPrefixPaddingMs,
+            silence_duration_ms: config.xai.vadSilenceMs,
+          },
           tools: sessionTools(this.opts.ownerName),
           tool_choice: "auto",
         },
       });
       this.open = true;
-      // Agent speaks first (we're the caller), unless the provider is holding the greeting for the human leg to answer.
-      if (!this.opts.deferGreeting) this.startConversation();
+      // Never speak on open. If the provider already knows the human answered (deferGreeting false), arm the greeting wait now.
+      if (!this.opts.deferGreeting) { this.answered = false; this.onHumanAnswered(); }
     });
     this.ws.on("message", (data: unknown) => this.handle(String(data)));
     this.ws.on("close", (code: number, reason: unknown) => { this.closed = true; this.emit("closed", { code, reason: String(reason ?? "") }); });
     this.ws.on("error", (e: Error) => { log.error("xai.realtime.error", { error: String(e) }); this.emit("error", e); });
   }
 
-  close(): void { this.ws?.close(); }
+  close(): void {
+    if (this.greetingTimer) clearTimeout(this.greetingTimer);
+    if (this.graceTimer) clearTimeout(this.graceTimer);
+    this.ws?.close();
+  }
 
   private send(msg: Record<string, unknown>) {
     this.ws?.send(JSON.stringify(msg));
@@ -119,9 +159,18 @@ export class XaiRealtimeSession extends EventEmitter {
       case "conversation.item.input_audio_transcription.completed": {
         const text = ev.transcript ?? ev.item?.content?.[0]?.transcript ?? "";
         if (text) this.pushTurn({ speaker: "human", text });
+        this.onHumanSpeech();
         break;
       }
+      case "input_audio_buffer.speech_stopped":
+        this.onHumanSpeech();
+        break;
+      case "response.created":
+        this.responding = true; this.greeted = true;
+        if (this.graceTimer) { clearTimeout(this.graceTimer); this.graceTimer = null; }
+        break;
       case "response.output_audio_transcript.delta":
+        this.responding = true; this.greeted = true;
         this.assistantBuffer += ev.delta ?? "";
         break;
       case "response.output_audio_transcript.done": {
@@ -137,6 +186,7 @@ export class XaiRealtimeSession extends EventEmitter {
         await this.dispatchTool(ev.name, ev.call_id, ev.arguments);
         break;
       case "response.done": {
+        this.responding = false;
         for (const item of ev.response?.output ?? []) {
           if (item.type === "function_call") await this.dispatchTool(item.name, item.call_id, item.arguments);
         }
