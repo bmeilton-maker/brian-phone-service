@@ -132,7 +132,7 @@ export class XaiProvider implements PhoneProvider {
     if (!c.answered_at) c.answered_at = this.now();
     c.human_answered ??= true;
     if (c.state !== "needs_user") c.state = "in_progress";
-    c.session?.startConversation();
+    c.session?.onHumanAnswered();
   }
 
   /** Twilio async AMD callback: AnsweredBy = human | machine_start | machine_end_beep | machine_end_silence | machine_end_other | fax | unknown */
@@ -166,6 +166,8 @@ export class XaiProvider implements PhoneProvider {
       wsFactory: this.deps.wsFactory,
       // Hold the opening line until the human leg answers; release in markAnswered().
       deferGreeting: !c.answered_at,
+      greetingWaitMs: config.xai.greetingWaitMs,
+      autoResponseGraceMs: config.xai.autoResponseGraceMs,
       hooks: {
         onAskOwner: (question, options) => this.holdForOwner(c, question, options),
         onEndCall: async (reason) => {
@@ -192,11 +194,12 @@ export class XaiProvider implements PhoneProvider {
       void this.reconcile(c);
     });
     session.on("error", (e: Error) => { c.raw.realtime_error = String(e); });
+    session.on("greeting_fallback", () => { c.raw.greeting_fallback = true; log.info("xai.greeting_fallback", { task_id: c.task_id, note: "human did not speak after pickup; agent opened" }); });
     c.session = session;
     // The SIP leg is live but the human is not on yet (unless the child leg already reported answered).
     if (c.answered_at) c.state = c.state === "needs_user" ? c.state : "in_progress";
     session.connect();
-    if (c.answered_at) session.startConversation();
+    if (c.answered_at) session.onHumanAnswered();
     log.info("xai.session_attached", { task_id: c.task_id, xai_call_id: xaiCallId });
     return { attached: true, task_id: c.task_id };
   }

@@ -18,6 +18,8 @@ Object.assign(config.xai, { apiKey: "test-key", sipNumber: "+16145559999", webho
 Object.assign(config.twilio, { accountSid: "ACtest", authToken: "tok", fromNumber: "+16145550000" });
 (config as { publicBaseUrl: string }).publicBaseUrl = "https://example.test";
 (config as { needsUserHoldSeconds: number }).needsUserHoldSeconds = 0.05;
+Object.assign(config.xai, { greetingWaitMs: 60, autoResponseGraceMs: 20, vadSilenceMs: 400, vadThreshold: 0.5, vadPrefixPaddingMs: 300 });
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function fakeTwilio(remote: { status: string; duration?: string } = { status: "completed", duration: "60" }) {
   const forms: Record<string, string>[] = [];
@@ -92,11 +94,17 @@ test("xai end-to-end (faked): dial -> incoming webhook -> session.update with en
   assert.equal((await p.getOutcome("CA123")).state, "ringing");
   assert.equal((await p.getOutcome("CA123")).duration_seconds, null, "no talk time before answer");
   p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: "CA123", CallStatus: "in-progress" });
-  assert.equal(JSON.parse(ws.sent[1]).type, "response.create", "greeting released on human answer");
+  assert.equal(ws.sent.length, 1, "still silent on bare pickup; waits for the human to say hello");
   p.handleTwilioAmd({ CallSid: "CA456", AnsweredBy: "human" });
+  assert.deepEqual(su.session.turn_detection, { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 400 });
 
   const sess = (p as unknown as { calls: Map<string, { session: { handle(s: string): Promise<void> } }> }).calls.get("CA123")!.session;
+  await sess.handle(JSON.stringify({ type: "conversation.item.input_audio_transcription.completed", transcript: "Riverside Dental, this is Maria." }));
+  await sess.handle(JSON.stringify({ type: "response.created" }));
+  await sleep(40);
+  assert.equal(ws.sent.filter((m) => JSON.parse(m).type === "response.create").length, 0, "xAI auto-responded to the greeting; no nudge sent");
   await sess.handle(JSON.stringify({ type: "response.output_audio_transcript.done", transcript: "Hi, this is Brian's AI assistant." }));
+  await sess.handle(JSON.stringify({ type: "response.done", response: { output: [] } }));
   await sess.handle(JSON.stringify({ type: "conversation.item.input_audio_transcription.completed", transcript: "Sure, Tuesday at 10." }));
   await sess.handle(JSON.stringify({ type: "response.done", response: { output: [{ type: "function_call", name: "report_outcome", call_id: "c1", arguments: JSON.stringify({ status: "success", summary: "Booked Tuesday 10.", human_or_business_reached: "receptionist", results: { "appointment date": "Tuesday" }, commitments_made: [], financial_commitments: [], dates_and_times: ["Tuesday 10:00"], confirmation_numbers: [], follow_up_required: false, follow_up: null, questions_for_brian: [] }) }] } }));
   const fco = ws.sent.map((m) => JSON.parse(m)).find((m) => m.type === "conversation.item.create");
@@ -118,7 +126,54 @@ test("xai end-to-end (faked): dial -> incoming webhook -> session.update with en
   assert.equal(out.voicemail, false);
   assert.equal(out.provider_extraction?.status, "success");
   assert.match(out.transcript, /Tuesday at 10/);
+  assert.match(out.transcript, /^human: Riverside Dental/, "human greeting is the first turn");
   assert.ok(ws.closed);
+});
+
+test("greeting hold: nudge with response.create only if xAI does not auto-respond after the human greets", async () => {
+  const { p, ws } = makeProvider();
+  await p.startCall(input());
+  p.handleXaiIncoming({ data: { call_id: "xc1" } });
+  ws.emit("open");
+  p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: "CA123", CallStatus: "in-progress" });
+  const sess = (p as unknown as { calls: Map<string, { session: { handle(s: string): Promise<void> } }> }).calls.get("CA123")!.session;
+  await sess.handle(JSON.stringify({ type: "input_audio_buffer.speech_stopped" }));
+  assert.equal(ws.sent.filter((m) => JSON.parse(m).type === "response.create").length, 0, "no response.create inside the grace window");
+  await sleep(40);
+  assert.equal(ws.sent.filter((m) => JSON.parse(m).type === "response.create").length, 1, "nudged once after grace with no auto-response");
+  await sess.handle(JSON.stringify({ type: "conversation.item.input_audio_transcription.completed", transcript: "Hello?" }));
+  await sleep(40);
+  assert.equal(ws.sent.filter((m) => JSON.parse(m).type === "response.create").length, 1, "never nudges twice");
+});
+
+test("greeting hold: silent pickup falls back to opening after XAI_GREETING_WAIT_MS; pre-answer speech is ignored", async () => {
+  const { p, ws } = makeProvider();
+  await p.startCall(input());
+  p.handleXaiIncoming({ data: { call_id: "xc1" } });
+  ws.emit("open");
+  const sess = (p as unknown as { calls: Map<string, { session: { handle(s: string): Promise<void> } }> }).calls.get("CA123")!.session;
+  // ringback / SIP-leg noise before the human answers must not trigger anything
+  await sess.handle(JSON.stringify({ type: "input_audio_buffer.speech_stopped" }));
+  await sleep(40);
+  assert.equal(ws.sent.filter((m) => JSON.parse(m).type === "response.create").length, 0, "pre-answer speech ignored");
+  p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: "CA123", CallStatus: "in-progress" });
+  await sleep(30);
+  assert.equal(ws.sent.filter((m) => JSON.parse(m).type === "response.create").length, 0, "still waiting for hello");
+  await sleep(60);
+  assert.equal(ws.sent.filter((m) => JSON.parse(m).type === "response.create").length, 1, "opened after the wait");
+  assert.equal((await p.getOutcome("CA123")).raw.greeting_fallback, true);
+});
+
+test("VAD config comes from env-backed config", async () => {
+  const saved = { ...config.xai };
+  Object.assign(config.xai, { vadSilenceMs: 250, vadThreshold: 0.6, vadPrefixPaddingMs: 200 });
+  try {
+    const { p, ws } = makeProvider();
+    await p.startCall(input());
+    p.handleXaiIncoming({ data: { call_id: "xc1" } });
+    ws.emit("open");
+    assert.deepEqual(JSON.parse(ws.sent[0]).session.turn_detection, { type: "server_vad", threshold: 0.6, prefix_padding_ms: 200, silence_duration_ms: 250 });
+  } finally { Object.assign(config.xai, saved); }
 });
 
 test("xai needs_user: ask_owner holds, answer is delivered; timeout returns NO_ANSWER", async () => {

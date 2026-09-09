@@ -40,6 +40,14 @@ export const config = {
     sipNumber: env("XAI_SIP_NUMBER"),
     sipDomain: env("XAI_SIP_DOMAIN", "sip.voice.x.ai"),
     webhookSecret: env("XAI_WEBHOOK_SECRET"),
+    /** Server VAD tuning. silence_duration_ms is the pause before the agent takes its turn (~0.5s feel). */
+    vadSilenceMs: num("XAI_VAD_SILENCE_MS", 400),
+    vadThreshold: num("XAI_VAD_THRESHOLD", 0.5),
+    vadPrefixPaddingMs: num("XAI_VAD_PREFIX_PADDING_MS", 300),
+    /** After the human answers, wait this long for them to say hello before the agent opens anyway. */
+    greetingWaitMs: num("XAI_GREETING_WAIT_MS", 3000),
+    /** After the human's greeting, wait this long for xAI's auto-response before nudging with response.create. */
+    autoResponseGraceMs: num("XAI_AUTO_RESPONSE_GRACE_MS", 800),
   },
 
   twilio: {
