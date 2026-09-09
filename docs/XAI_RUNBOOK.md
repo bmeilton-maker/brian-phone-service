@@ -15,11 +15,19 @@
 | Twilio trunk origination `sip:{number}@sip.voice.x.ai;transport=tls` | docs.x.ai SIP page (search excerpt) | verified at excerpt level |
 | Voice Agent Builder: no outbound-dial API found; outbound goes through your own SIP provider | x.ai builder posts, search excerpts | not found, treated as absent |
 
+## Call topology (changed after the first live tests)
+
+Twilio dials the xAI SIP number FIRST (parent leg). xAI answers at once and the session attaches with the greeting held. TwiML on that live leg then `<Dial>`s the human (child leg, `ParentCallSid` = our call_id). The callee is bridged into an already-answered line, so no ringback is played to them. The greeting fires on the child leg's `in-progress` callback.
+
+Known cost of this ordering: the xAI SIP leg bills from the moment it answers, including the callee's ring time (typically 5 to 30 s). Server VAD should ignore ringback tones; if the agent ever starts talking before pickup, look for `response.create` before `twilio.status ... leg=pstn status=in-progress` in the logs and report it.
+
+Stuck-call guards: `end_call` finalizes locally after hanging up (no dependency on Twilio's `completed` callback); a closed socket triggers a Twilio reconcile; `get_status` reconciles when callbacks have been quiet for `TWILIO_RECONCILE_AFTER_MS`. A rejected Twilio signature is now logged as `twilio.webhook.rejected` with the URL we expected. If you see that, `PUBLIC_BASE_URL` does not match what Twilio is calling.
+
 ## What must be confirmed on the first live call (marked `VERIFY` in code)
 
 1. **Function calling shape.** Code sends `tools:[{type:"function",name,description,parameters}]` in `session.update`, reads `response.done -> response.output[].type=="function_call"` and `response.function_call_arguments.done`, replies with `conversation.item.create {type:"function_call_output", call_id, output}` then `response.create`. This is the OpenAI-Realtime-compatible shape the xAI docs say they mirror. Check `data/calls/<task>.json` events for `xai.tool_call`; if none appear on a completed call, dump raw events (set `LOG_LEVEL=debug`) and adjust `src/providers/xai/realtime.ts` `handle()`.
 2. **Webhook signature scheme.** `src/providers/xai/webhook.ts` implements Standard Webhooks (`base64 HMAC-SHA256("id.timestamp.body")`, header `v1,<sig>`, `whsec_` secret). If xAI rejects with 401 in `xai.webhook.rejected`, compare with the docs' verification snippet.
-3. **Task correlation.** TwiML adds `?X-Task-Id=` to the SIP URI. If xAI surfaces SIP headers in `data.sip_headers` or `data.headers` we use them; otherwise we attach the oldest pending dial. Safe while calls are placed one at a time. If you ever run concurrent xai calls, confirm header passthrough first.
+3. **Task correlation.** The API `To` SIP URI carries `?X-Task-Id=`. If xAI surfaces SIP headers in `data.sip_headers` or `data.headers` we use them; otherwise we attach the oldest pending dial. Safe while calls are placed one at a time. If you ever run concurrent xai calls, confirm header passthrough first.
 4. **Audio format on SIP calls.** For SIP, xAI owns the media leg, so `session.update` omits `audio`. If the session errors on missing audio config, add `audio:{input:{format:{type:"audio/pcmu",rate:8000}},output:{...}}`.
 5. **DTMF.** Not implemented on the Twilio<->xAI bridge; `send_dtmf` returns `ok:false` and the agent asks for a representative. Options if IVR navigation matters: (a) Twilio `<Dial sendDigits>` pre-dial digits for known menus, (b) switch to Twilio Media Streams and bridge audio yourself (then DTMF via Twilio's API), (c) check whether xAI adds a DTMF event.
 6. **Recording.** Not enabled on the bridge leg. Add `Record="true"` (and `RecordingStatusCallback`) to the Twilio dial form if you want a `recording_reference`, and confirm one-party consent rules in Ohio and the callee's state.

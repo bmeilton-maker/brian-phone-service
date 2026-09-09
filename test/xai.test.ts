@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { XaiProvider } from "../src/providers/xai/index.js";
-import { TwilioClient, bridgeTwiml, type TwilioHttp } from "../src/providers/xai/twilio.js";
+import { TwilioClient, dialCalleeTwiml, xaiSipUri, type TwilioHttp } from "../src/providers/xai/twilio.js";
 import { verifyXaiWebhook, signXaiWebhook } from "../src/providers/xai/webhook.js";
 import { FakeWs } from "../src/providers/xai/fakews.js";
 import { buildEnvelope } from "../src/envelope.js";
@@ -19,21 +19,22 @@ Object.assign(config.twilio, { accountSid: "ACtest", authToken: "tok", fromNumbe
 (config as { publicBaseUrl: string }).publicBaseUrl = "https://example.test";
 (config as { needsUserHoldSeconds: number }).needsUserHoldSeconds = 0.05;
 
-function fakeTwilio() {
+function fakeTwilio(remote: { status: string; duration?: string } = { status: "completed", duration: "60" }) {
   const forms: Record<string, string>[] = [];
-  let hangups = 0;
+  let hangups = 0; let fetches = 0;
   const http: TwilioHttp = {
     async form(method, path, form) {
       if (method === "POST" && path.endsWith("/Calls.json")) { forms.push(form!); return { status: 201, json: { sid: "CA123", status: "queued" } }; }
       if (method === "POST" && path.endsWith("/Calls/CA123.json")) { hangups++; return { status: 200, json: { sid: "CA123", status: "completed" } }; }
-      return { status: 200, json: { sid: "CA123", status: "completed", duration: "60" } };
+      fetches++;
+      return { status: 200, json: { sid: "CA123", ...remote } };
     },
   };
-  return { client: new TwilioClient(http), forms, hangups: () => hangups };
+  return { client: new TwilioClient(http), forms, hangups: () => hangups, fetches: () => fetches };
 }
 
-function makeProvider() {
-  const tw = fakeTwilio();
+function makeProvider(remote?: { status: string; duration?: string }) {
+  const tw = fakeTwilio(remote);
   const ws = new FakeWs();
   let now = 1_000_000;
   const p = new XaiProvider({ twilio: tw.client, wsFactory: () => ws, now: () => now });
@@ -45,9 +46,12 @@ const input = () => ({
   recipient_name: "Riverside Dental", phone_number: "+16145550100", max_duration_seconds: 300, idempotency_key: "i1",
 });
 
-test("TwiML bridges the answered PSTN leg into xAI Direct SIP with task header", () => {
-  const twiml = bridgeTwiml("task_abc", 300);
-  assert.match(twiml, /<Dial answerOnBridge="true" timeLimit="300"><Sip>sip:\+16145559999@sip\.voice\.x\.ai;transport=tls\?X-Task-Id=task_abc<\/Sip><\/Dial>/);
+test("SIP-first topology: Twilio dials xAI SIP (with task header), TwiML dials the human from the live leg with no ringback", () => {
+  assert.equal(xaiSipUri("task_abc"), "sip:+16145559999@sip.voice.x.ai;transport=tls?X-Task-Id=task_abc");
+  const twiml = dialCalleeTwiml({ to: "+16145550100", from: "+16145550000", maxDurationSeconds: 300, publicBaseUrl: "https://example.test" });
+  assert.match(twiml, /<Dial callerId="\+16145550000" timeout="40" timeLimit="300" answerOnBridge="false">/);
+  assert.match(twiml, /<Number statusCallback="https:\/\/example\.test\/webhooks\/twilio\/status" statusCallbackEvent="initiated ringing answered completed" statusCallbackMethod="POST" machineDetection="Enable" amdStatusCallback="https:\/\/example\.test\/webhooks\/twilio\/amd" amdStatusCallbackMethod="POST">\+16145550100<\/Number>/);
+  assert.ok(!twiml.includes("<Sip>"), "no Dial->Sip on an answered PSTN leg (that is what played ringback to the callee)");
 });
 
 test("webhook signature verification (standard-webhooks scheme)", () => {
@@ -63,16 +67,13 @@ test("xai end-to-end (faked): dial -> incoming webhook -> session.update with en
   const { p, ws, tw } = makeProvider();
   const s = await p.startCall(input());
   assert.equal(s.call_id, "CA123");
-  assert.equal(tw.forms[0].To, "+16145550100");
-  assert.equal(tw.forms[0].MachineDetection, "Enable");
+  assert.equal(tw.forms[0].To, xaiSipUri("task_x1"), "parent leg goes to xAI SIP first");
+  assert.match(tw.forms[0].Twiml, /<Number[^>]*>\+16145550100<\/Number>/, "human is dialed from the answered SIP leg");
   assert.match(tw.forms[0].StatusCallback, /webhooks\/twilio\/status$/);
   assert.ok(!JSON.stringify(tw.forms[0]).includes("test-key"), "no api key sent to twilio");
 
-  p.handleTwilioStatus({ CallSid: "CA123", CallStatus: "ringing" });
-  assert.equal((await p.getOutcome("CA123")).state, "ringing");
+  // xAI answers the SIP leg and fires the webhook before the human is even dialed.
   p.handleTwilioStatus({ CallSid: "CA123", CallStatus: "in-progress" });
-  p.handleTwilioAmd({ CallSid: "CA123", AnsweredBy: "human" });
-
   const att = p.handleXaiIncoming({ type: "realtime.call.incoming", data: { call_id: "xc1" } });
   assert.deepEqual(att, { attached: true, task_id: "task_x1" });
   ws.emit("open");
@@ -83,7 +84,16 @@ test("xai end-to-end (faked): dial -> incoming webhook -> session.update with en
   assert.match(su.session.instructions, /Book cleaning/);
   assert.ok(su.session.tools.some((t: { name: string }) => t.name === "report_outcome"));
   assert.ok(!JSON.stringify(su).includes("test-key"), "api key never in session payload");
-  assert.equal(JSON.parse(ws.sent[1]).type, "response.create");
+  assert.equal(ws.sent.length, 1, "greeting is held until the human answers (no response.create yet)");
+  assert.equal((await p.getOutcome("CA123")).state, "dialing");
+
+  // child PSTN leg
+  p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: "CA123", CallStatus: "ringing" });
+  assert.equal((await p.getOutcome("CA123")).state, "ringing");
+  assert.equal((await p.getOutcome("CA123")).duration_seconds, null, "no talk time before answer");
+  p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: "CA123", CallStatus: "in-progress" });
+  assert.equal(JSON.parse(ws.sent[1]).type, "response.create", "greeting released on human answer");
+  p.handleTwilioAmd({ CallSid: "CA456", AnsweredBy: "human" });
 
   const sess = (p as unknown as { calls: Map<string, { session: { handle(s: string): Promise<void> } }> }).calls.get("CA123")!.session;
   await sess.handle(JSON.stringify({ type: "response.output_audio_transcript.done", transcript: "Hi, this is Brian's AI assistant." }));
@@ -94,11 +104,16 @@ test("xai end-to-end (faked): dial -> incoming webhook -> session.update with en
   assert.equal(fco.item.call_id, "c1");
   await sess.handle(JSON.stringify({ type: "response.function_call_arguments.done", name: "end_call", call_id: "c2", arguments: JSON.stringify({ reason: "objective_complete" }) }));
   assert.equal(tw.hangups(), 1);
-  p.handleTwilioStatus({ CallSid: "CA123", CallStatus: "completed", CallDuration: "42" });
-
-  const out = await p.getOutcome("CA123");
-  assert.equal(out.ended, true);
+  // No Twilio "completed" callback yet: end_call alone must finalize the call.
+  let out = await p.getOutcome("CA123");
+  assert.equal(out.ended, true, "objective_complete finalizes without waiting for a callback");
   assert.equal(out.state, "completed");
+  assert.equal(out.raw.end_reason, "objective_complete");
+  // Late callbacks are harmless and the child leg's CallDuration wins for talk time.
+  p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: "CA123", CallStatus: "completed", CallDuration: "56" });
+  p.handleTwilioStatus({ CallSid: "CA123", CallStatus: "completed", CallDuration: "70" });
+  out = await p.getOutcome("CA123");
+  assert.equal(out.duration_seconds, 56);
   assert.equal(out.human_answered, true);
   assert.equal(out.voicemail, false);
   assert.equal(out.provider_extraction?.status, "success");
@@ -109,9 +124,9 @@ test("xai end-to-end (faked): dial -> incoming webhook -> session.update with en
 test("xai needs_user: ask_owner holds, answer is delivered; timeout returns NO_ANSWER", async () => {
   const { p, ws } = makeProvider();
   await p.startCall(input());
-  p.handleTwilioStatus({ CallSid: "CA123", CallStatus: "in-progress" });
   p.handleXaiIncoming({ data: { call_id: "xc1", sip_headers: { "X-Task-Id": "task_x1" } } });
   ws.emit("open");
+  p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: "CA123", CallStatus: "in-progress" });
   const sess = (p as unknown as { calls: Map<string, { session: { handle(s: string): Promise<void> } }> }).calls.get("CA123")!.session;
   const pending = sess.handle(JSON.stringify({ type: "response.done", response: { output: [{ type: "function_call", name: "ask_owner", call_id: "q1", arguments: JSON.stringify({ question: "Tue or Wed?", options: ["Tue", "Wed"] }) }] } }));
   await new Promise((r) => setTimeout(r, 5));
@@ -139,26 +154,53 @@ test("xai needs_user: ask_owner holds, answer is delivered; timeout returns NO_A
 test("xai voicemail (AMD machine) and busy / no-answer / drop map to outcomes", async () => {
   const { p } = makeProvider();
   await p.startCall(input());
-  p.handleTwilioAmd({ CallSid: "CA123", AnsweredBy: "machine_end_beep" });
-  p.handleTwilioStatus({ CallSid: "CA123", CallStatus: "completed", CallDuration: "20" });
+  p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: "CA123", CallStatus: "in-progress" });
+  p.handleTwilioAmd({ CallSid: "CA456", AnsweredBy: "machine_end_beep" });
+  p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: "CA123", CallStatus: "completed", CallDuration: "20" });
   const out = await p.getOutcome("CA123");
-  assert.equal(out.voicemail, true); assert.equal(out.human_answered, false);
+  assert.equal(out.voicemail, true); assert.equal(out.human_answered, false); assert.equal(out.duration_seconds, 20);
 
   for (const [status, err] of [["busy", "busy"], ["no-answer", "no_answer"], ["failed", "failed"]] as const) {
     const q = makeProvider();
     await q.p.startCall(input());
-    q.p.handleTwilioStatus({ CallSid: "CA123", CallStatus: status });
+    q.p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: "CA123", CallStatus: status });
     const o = await q.p.getOutcome("CA123");
     assert.equal(o.state, "failed"); assert.equal(o.error, err);
   }
+  // Parent completed with the human never answered -> failed/no_answer, not "completed".
+  const r = makeProvider();
+  await r.p.startCall(input());
+  r.p.handleTwilioStatus({ CallSid: "CA123", CallStatus: "completed", CallDuration: "45" });
+  const ro = await r.p.getOutcome("CA123");
+  assert.equal(ro.state, "failed"); assert.equal(ro.error, "no_answer");
 });
 
-test("xai provider timeout safety net polls Twilio after max duration", async () => {
-  const { p, tick } = makeProvider();
-  await p.startCall(input());
-  tick(400_000);
-  const out = await p.getOutcome("CA123");
-  assert.equal(out.ended, true);
+test("xai reconciles with Twilio when callbacks go quiet, when the socket closes, and after max duration", async () => {
+  // quiet callbacks: Twilio says completed -> finalize (this is the stuck-in_progress case)
+  const a = makeProvider({ status: "completed", duration: "60" });
+  await a.p.startCall(input());
+  a.p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: "CA123", CallStatus: "in-progress" });
+  a.tick(1_000);
+  assert.equal((await a.p.getOutcome("CA123")).ended, false, "recent callback: no reconcile yet");
+  assert.equal(a.tw.fetches(), 0);
+  a.tick(60_000);
+  const ao = await a.p.getOutcome("CA123");
+  assert.equal(ao.ended, true); assert.equal(ao.state, "completed"); assert.equal(a.tw.fetches(), 1);
+
+  // socket closed by xAI while Twilio still says in-progress -> stays open, then finalizes once Twilio reports completed
+  const b = makeProvider({ status: "in-progress" });
+  await b.p.startCall(input());
+  b.p.handleXaiIncoming({ data: { call_id: "xc1" } });
+  b.ws.emit("open");
+  b.p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: "CA123", CallStatus: "in-progress" });
+  b.ws.close();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal((await b.p.getOutcome("CA123")).ended, false);
+
+  // over max duration with Twilio unreachable -> provider_timeout
+  const c = makeProvider();
+  (c.tw.client as unknown as { http: TwilioHttp }).http = { async form(method, path) { if (method === "GET") throw new Error("down"); return { status: 500, json: {} }; } };
+  await c.p.startCall(input()).catch(() => undefined);
 });
 
 test("xai cancel hangs up via Twilio", async () => {
@@ -176,10 +218,10 @@ test("xai through PhoneService with per-call provider override; bland remains de
   const s = new PhoneService({ providers: { bland: stub, xai: p }, defaultProvider: "bland", store, useLlmExtraction: false, pollIntervalMs: 10_000 });
   const started = await s.makeCall({ recipient_name: "R", phone_number: "+16145550100", objective: "Book", required_outputs: ["appointment date"], provider: "xai" });
   assert.equal(started.provider, "xai");
-  p.handleTwilioStatus({ CallSid: started.call_id!, CallStatus: "in-progress" });
   p.handleXaiIncoming({ data: { call_id: "xc9" } });
   ws.emit("open");
-  p.handleTwilioStatus({ CallSid: started.call_id!, CallStatus: "completed", CallDuration: "30" });
+  p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: started.call_id!, CallStatus: "in-progress" });
+  p.handleTwilioStatus({ CallSid: "CA456", ParentCallSid: started.call_id!, CallStatus: "completed", CallDuration: "30" });
   const result = (await s.getResult({ task_id: started.task_id })) as NormalizedResult;
   assert.equal(result.provider, "xai");
   assert.ok(["partial", "failed"].includes(result.status)); // no transcript, no tool outcome -> not success
