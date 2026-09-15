@@ -399,6 +399,11 @@ export class OpenAiLiveProvider implements PhoneProvider {
     c.raw.hangup_at = new Date(c.hangup_at).toISOString();
     c.raw.close_ms = c.hangup_at - t0;
     log.info("openai_live.hangup", { task_id: c.task_id, trigger: closing.trigger, close_ms: c.raw.close_ms, tail_after_goodbye_ms: c.hangup_at - t0 - (c.raw.goodbye_done_ms as number) + t.goodbyeQuietMs, outcome_recorded: !!c.outcome });
+    // Closing the Media Stream socket ends the <Connect><Stream> call on Twilio's side at once (nothing follows it in
+    // the TwiML); the REST hangup runs in parallel as the authoritative fallback.
+    const stream = c.stream;
+    c.stream = null;
+    try { stream?.ws.close(); } catch { /* ignore */ }
     await this.twilio.hangup(c.twilio_sid).catch((e) => log.warn("twilio.hangup_failed", { error: String(e) }));
     if (c.ended_at) return;
 
