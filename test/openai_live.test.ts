@@ -255,8 +255,9 @@ test("stale backend results after the call ends are recorded but not fed back to
   assert.equal(tw.hangups(), 0, "call already over; nothing to hang up");
   // a late end_call from the backend is harmless too
   await sess.handle(JSON.stringify({ type: "response.event", delegation_id: "item_e", event: { type: "response.output_item.done", item: { type: "function_call", status: "completed", call_id: "e9", name: "end_call", arguments: JSON.stringify({ reason: "other" }) } } }));
-  assert.equal(tw.hangups(), 1, "end_call hook still runs hangup (idempotent on Twilio's side)");
+  assert.equal(tw.hangups(), 0, "no hangup request for a call that already ended");
   assert.equal((await p.getOutcome("CA900")).duration_seconds, 12, "already-ended call keeps its Twilio duration");
+  assert.equal((await p.getOutcome("CA900")).raw.end_reason, "other", "late end_call still records its reason");
 });
 
 test("greeting hold: silent pickup opens after OPENAI_LIVE_GREETING_WAIT_MS via instructions.append + commentary.append, once", async () => {
@@ -392,11 +393,22 @@ test("stream stop / session close reconcile against Twilio; quiet callbacks reco
   assert.equal(ao.ended, true); assert.equal(ao.state, "completed"); assert.equal(ao.duration_seconds, 33); assert.equal(a.tw.fetches(), 1);
   assert.ok(sentTypes(a.ws).includes("session.close") || a.ws.closed, "OpenAI session is closed when the stream stops");
 
-  // Twilio still in-progress when the OpenAI socket drops -> stays open
+  // OpenAI drops the session while Twilio is still in-progress -> we hang up the callee leg instead of leaving dead air
   const b = await answeredCall({ remote: { status: "in-progress" } });
+  await session(b.p).handle(JSON.stringify({ type: "session.started", session: { id: "live_drop" } }));
   b.ws.close();
   await sleep(5);
-  assert.equal((await b.p.getOutcome("CA900")).ended, false);
+  const bo = await b.p.getOutcome("CA900");
+  assert.equal(bo.ended, true); assert.equal(bo.state, "failed"); assert.match(String(bo.error), /^live_session_closed:/);
+  assert.equal(b.tw.hangups(), 1, "Twilio leg hung up after the session dropped");
+  assert.equal(b.media.closed, true);
+
+  // ... but a session we closed ourselves (stream stopped) still just reconciles
+  const b2 = await answeredCall({ remote: { status: "in-progress" } });
+  b2.media.twilio({ event: "stop" });
+  await sleep(5);
+  assert.equal((await b2.p.getOutcome("CA900")).ended, false);
+  assert.equal(b2.tw.hangups(), 0);
 
   // quiet callbacks -> reconcile after TWILIO_RECONCILE_AFTER_MS
   const c = makeProvider({ status: "completed", duration: "60" });
