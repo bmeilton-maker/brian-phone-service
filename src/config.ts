@@ -17,7 +17,10 @@ export const config = {
   dataDir: env("DATA_DIR", "./data"),
   logLevel: env("LOG_LEVEL", "info"),
   defaultMaxDurationSeconds: num("DEFAULT_MAX_DURATION_SECONDS", 600),
-  needsUserHoldSeconds: num("NEEDS_USER_HOLD_SECONDS", 45),
+  /** How long the agent holds the line for Brian's answer (ask_owner) before falling back to a callback. */
+  needsUserHoldSeconds: num("NEEDS_USER_HOLD_SECONDS", 60),
+  /** After the hold timed out, an answer that arrives within this window is still delivered to the agent mid-call. */
+  needsUserLateAnswerSeconds: num("NEEDS_USER_LATE_ANSWER_SECONDS", 180),
 
   bland: {
     apiKey: env("BLAND_API_KEY"),
@@ -53,8 +56,8 @@ export const config = {
   openaiLive: {
     apiKey: env("OPENAI_API_KEY"),
     model: env("OPENAI_LIVE_MODEL", "gpt-live-1"),
-    /** GPT-Live voice (default marin). Others: gleam, meridian, quartz, ripple, vesper, willow, stone, delta, cinder ... */
-    voice: env("OPENAI_LIVE_VOICE", "marin"),
+    /** GPT-Live voice. Brian's pick is willow; others: marin (OpenAI default), gleam, meridian, quartz, ripple, vesper, stone, delta, cinder ... */
+    voice: env("OPENAI_LIVE_VOICE", "willow"),
     /** Responses-delegation backend that runs report_outcome / ask_owner / end_call. Docs: start with gpt-5.6-terra; gpt-5.6-luna is cheaper. */
     backendModel: env("OPENAI_LIVE_BACKEND_MODEL", "gpt-5.6-terra"),
     /** Optional `reasoning.effort` for the backend model (e.g. low). Unset = model default. */
@@ -64,10 +67,21 @@ export const config = {
     wsUrl: env("OPENAI_LIVE_WS_URL", "wss://api.openai.com/v1/live/sessions"),
     /** After the callee picks up, stay silent this long waiting for their hello before the agent opens anyway. */
     greetingWaitMs: num("OPENAI_LIVE_GREETING_WAIT_MS", 3000),
-    /** After end_call, wait for the agent's goodbye audio to drain before Twilio hangs up (max). */
-    hangupDelayMs: num("OPENAI_LIVE_HANGUP_DELAY_MS", 2500),
-    /** Send Twilio `clear` (drop queued agent audio) as soon as the human starts talking. GPT-Live already stops itself; this only trims Twilio's playout buffer. */
-    clearOnBargeIn: env("OPENAI_LIVE_CLEAR_ON_BARGE_IN", "false").toLowerCase() === "true",
+    /**
+     * Hangup sequence: after end_call / a goodbye, wait at most this long for the agent's goodbye audio to START (it
+     * must cover one backend round trip when end_call arrives before the goodbye is spoken); once speaking, the goodbye
+     * is allowed to finish and the line drops ~0.5 s + Twilio playout after its last word. 0 = hang up immediately (tests).
+     */
+    hangupDelayMs: num("OPENAI_LIVE_HANGUP_DELAY_MS", 3000),
+    /** Hang up on farewell intent (agent goodbye sentence, or callee goodbye + agent silence), not only on end_call. */
+    farewellHangup: env("OPENAI_LIVE_FAREWELL_HANGUP", "true").toLowerCase() !== "false",
+    /** After the callee says goodbye, hang up once the agent has been silent this long (doubled while a backend delegation is in flight; the agent's own goodbye ends the call sooner). */
+    farewellSilenceMs: num("OPENAI_LIVE_FAREWELL_SILENCE_MS", 2500),
+    /**
+     * Send Twilio `clear` (drop the agent audio still queued at Twilio) when the callee interrupts with something
+     * substantive (not "mm-hm"/"okay"). GPT-Live stops generating on its own; this stops the already-buffered tail.
+     */
+    clearOnBargeIn: env("OPENAI_LIVE_CLEAR_ON_BARGE_IN", "true").toLowerCase() !== "false",
     /** session.store=true keeps a 30-day recording at OpenAI (must be enabled on the project). */
     store: env("OPENAI_LIVE_STORE", "false").toLowerCase() === "true",
     /** Twilio ring timeout (s) before no-answer. */

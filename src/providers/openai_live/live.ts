@@ -5,6 +5,7 @@ import { config } from "../../config.js";
 import { log } from "../../logger.js";
 import { RESULT_JSON_SCHEMA } from "../../extraction.js";
 import type { TranscriptTurn } from "../../types.js";
+import { classifyHumanUtterance, isClosingLine, type HumanUtteranceKind } from "./farewell.js";
 
 /**
  * One OpenAI GPT-Live session (model gpt-live-1) bridged to a Twilio Media Stream.
@@ -31,6 +32,11 @@ import type { TranscriptTurn } from "../../types.js";
  *
  * GPT-Live is full duplex and owns turn-taking: there is no VAD config, no response.create-to-speak loop, and no
  * output-audio-done event. Interruptions are handled by the model; we optionally `clear` Twilio's playout buffer.
+ *
+ * Closing is owned by the application, not the model: the session flags farewell intent (`farewell` when the agent's
+ * last sentence is a goodbye, `farewell_silence` when the callee said goodbye and the agent stayed quiet) and the
+ * bridge runs the hangup sequence. While the bridge is closing, `closingStage` gates what may still reach the model
+ * (no `response.create` once the goodbye has played, no more input audio once `muteInput()` was called).
  */
 
 /** Slim tool set. send_dtmf is omitted: Media Streams cannot inject DTMF into the call. */
@@ -41,7 +47,7 @@ export function backendTools(ownerName: string) {
     { type: "function", name: "report_outcome", description: `Record the structured outcome of the call for ${ownerName}. Call this once, right before the assistant says goodbye, or as soon as the call clearly cannot proceed.`, parameters: RESULT_JSON_SCHEMA },
     { type: "function", name: "ask_owner", description: `Ask ${ownerName} a question the assistant cannot answer from its instructions or authority. Returns ${ownerName}'s answer, or "NO_ANSWER" if they did not respond in time.`,
       parameters: { type: "object", additionalProperties: false, required: ["question"], properties: { question: { type: "string" }, options: { type: "array", items: { type: "string" } } } } },
-    { type: "function", name: "end_call", description: "Hang up the phone call. Only after the assistant has said goodbye and report_outcome has been called.", parameters: { type: "object", additionalProperties: false, required: ["reason"], properties: { reason: { type: "string", enum: ["objective_complete", "voicemail_left", "wrong_number", "cannot_complete", "needs_owner", "hold_too_long", "other"] } } } },
+    { type: "function", name: "end_call", description: "Hang up the phone call. Call this right after report_outcome, in the same turn, as soon as the conversation is finished (objective done, cannot proceed, voicemail left, wrong number, or the person is saying goodbye). Do not wait for a goodbye to appear in the transcript: the assistant's one-sentence goodbye is allowed to finish before the line drops. Call it once.", parameters: { type: "object", additionalProperties: false, required: ["reason"], properties: { reason: { type: "string", enum: ["objective_complete", "voicemail_left", "wrong_number", "cannot_complete", "needs_owner", "hold_too_long", "other"] } } } },
     { type: "function", name: "note_hold", description: "Record that the assistant has been placed on hold or hears hold music/silence.", parameters: { type: "object", additionalProperties: false, required: ["note"], properties: { note: { type: "string" } } } },
   ];
 }
@@ -58,8 +64,8 @@ You are the back office for the voice assistant speaking on a live phone call fo
 WHAT TO DO
 - Fact, preference or choice question (a detail about ${ownerName}, which offered option fits, what still needs to be found out): answer in one sentence from RELEVANT CONTEXT, PREFERENCES and REQUIRED OUTPUTS above. If the context does not have it, say so plainly; the assistant must not invent it.
 - Authority question (may the assistant agree to something, or disclose something): answer from AUTHORITY above in one sentence. Anything not listed as YES is NO; then the assistant must say it needs to check with ${ownerName}.
-- ${ownerName}'s decision needed: call ask_owner with a crisp question and the options, then relay the answer in one sentence. If the answer is NO_ANSWER, tell the assistant to take the best callback number and any reference number, thank the person and end the call.
-- Record the outcome / end the call (objective done, cannot proceed, voicemail left, wrong number, goodbye said): call report_outcome with everything learned (status success only if the objective and required outputs were achieved without any unauthorized commitment), then call end_call with the matching reason.
+- ${ownerName}'s decision needed: call ask_owner with a crisp question and the options, then relay the answer in one sentence. If the answer is NO_ANSWER, tell the assistant to take the best callback number and any reference number, thank the person and end the call (if ${ownerName}'s answer arrives later during the call, the assistant is told directly and should use it).
+- Record the outcome / end the call (objective done, cannot proceed, voicemail left, wrong number, the person is wrapping up or saying goodbye): in ONE turn call report_outcome with everything learned (status success only if the objective and required outputs were achieved without any unauthorized commitment), then call end_call with the matching reason, then reply with the single short goodbye sentence the assistant should say (a few words confirming the result, thanks, goodbye). Nothing else: the line is dropped automatically once that sentence has played. Never tell the assistant to say goodbye and come back to you; never ask it to check whether there is anything else.
 - On hold: call note_hold.
 - Stale or repeated requests: if the person changed or withdrew a request, act on the latest one and ignore the earlier result. Never repeat report_outcome or end_call once they have been called. Never invent facts, confirmation numbers or commitments.`;
 }
@@ -97,16 +103,24 @@ export interface LiveSessionOptions {
   hooks: LiveHooks;
   wsFactory?: (url: string, headers: Record<string, string>) => LiveWsLike;
   greetingWaitMs?: number;
-  /** Text spoken if the callee picks up and says nothing (greeting fallback). */
+  /** Opening guidance used if the callee picks up and says nothing (greeting fallback); default is a purpose-first line. */
   openingLine?: string;
+  /** Emit `farewell` / `farewell_silence` so the bridge can hang up on goodbye. Default true. */
+  farewellDetection?: boolean;
+  /** After the callee says goodbye, emit `farewell_silence` once the agent has been quiet this long. */
+  farewellSilenceMs?: number;
   now?: () => number;
 }
+
+/** Where the bridge is in its hangup sequence; gates what may still reach the live model. */
+export type ClosingStage = "none" | "goodbye" | "done";
 
 const USER_AGENT = "brian-phone-service/Node 0.1.0";
 const TURN_FLUSH_MS = 1200;
 const TURN_GAP_MS = 1500;
 const TURN_OVERLAP_TOLERANCE_MS = 300;
 const AGENT_SILENCE_GAP_MS = 500;
+const DEFAULT_FAREWELL_SILENCE_MS = 2500;
 
 export class OpenAiLiveSession extends EventEmitter {
   readonly turns: TranscriptTurn[] = [];
@@ -117,6 +131,10 @@ export class OpenAiLiveSession extends EventEmitter {
   readonly latency: LiveLatency = { session_started_ms: null, first_human_transcript_ms: null, first_agent_audio_ms: null, turn_latencies_ms: [], delegation_roundtrips_ms: [], greeting_fallback: false };
   started = false;
   closed = false;
+  /** Set by the bridge while it runs the hangup sequence. */
+  closingStage: ClosingStage = "none";
+  /** Once set, inbound audio is no longer forwarded (the goodbye has played; the model must not start a new turn). */
+  inputMuted = false;
 
   private ws: LiveWsLike | null = null;
   private now: () => number;
@@ -128,6 +146,11 @@ export class OpenAiLiveSession extends EventEmitter {
   private closeTimer: NodeJS.Timeout | null = null;
   private closeRequested = false;
   private handledCalls = new Set<string>();
+  private lastAssistantTurnText = "";
+  private assistantFarewellFlagged = false;
+  private humanFarewellAt = 0;
+  private farewellTimer: NodeJS.Timeout | null = null;
+  private bargeInSent = false;
   private buffers: Record<"human" | "assistant", { text: string; startedAt: number; lastEndMs: number; timer: NodeJS.Timeout | null }> = {
     human: { text: "", startedAt: 0, lastEndMs: -1, timer: null },
     assistant: { text: "", startedAt: 0, lastEndMs: -1, timer: null },
@@ -169,11 +192,34 @@ export class OpenAiLiveSession extends EventEmitter {
     };
   }
 
-  /** Twilio inbound mu-law frame (base64). Dropped until session.started, as the docs require. */
+  /** Twilio inbound mu-law frame (base64). Dropped until session.started, as the docs require, and after muteInput(). */
   appendAudio(b64: string): void {
-    if (!this.started || this.closed || this.closeRequested) return;
+    if (!this.started || this.closed || this.closeRequested || this.inputMuted) return;
     this.send({ type: "session.input_audio.append", audio: b64 });
   }
+
+  /** Nudge the live model to act now (e.g. relay an answer); pairs with appendInstructions. No-op before session.started. */
+  appendCommentary(eventId: string, content: string): void {
+    if (!this.started || this.closed || this.closeRequested) return;
+    this.send({ type: "session.commentary.append", event_id: eventId, delegation_id: null, content });
+  }
+
+  /** Stop forwarding the callee's audio: the goodbye has played and the line is about to drop. */
+  muteInput(): void { this.inputMuted = true; }
+
+  /** The bridge cancelled or abandoned a close: back to normal; the agent's next goodbye may start a new one. */
+  resetClosing(): void { this.closingStage = "none"; this.assistantFarewellFlagged = false; }
+
+  /** True while we requested session.close ourselves (as opposed to OpenAI dropping the socket). */
+  get wasCloseRequested(): boolean { return this.closeRequested; }
+  /** Wall-clock (opts.now) of the last agent audio delta; 0 before the agent has spoken. */
+  get lastAgentAudioAtMs(): number { return this.lastAgentAudioAt; }
+  /** A Responses delegation was created and its response has not completed yet. */
+  get hasDelegationInFlight(): boolean { return this.delegations.size > 0; }
+  /** The agent's current (unflushed) utterance, or its last completed turn. */
+  currentAssistantText(): string { return this.buffers.assistant.text.trim() || this.lastAssistantTurnText; }
+  /** Whether the agent's most recent sentence is a goodbye (and not a question). */
+  agentIsClosing(): boolean { return isClosingLine(this.currentAssistantText()); }
 
   /** Record an application-side event (e.g. callee key press) in the transcript in chronological order. */
   noteSystem(text: string): void { this.pushTurn({ speaker: "system", text }); }
@@ -192,6 +238,9 @@ export class OpenAiLiveSession extends EventEmitter {
     if (!this.started) { this.closeRequested = true; this.ws?.close(); return; }
     this.send({ type: "session.close", event_id: "session_close" });
     this.closeRequested = true;
+    // The conversation is over; the buffered tail (usually the goodbye) belongs in the transcript now, not only once
+    // session.closed arrives.
+    this.flushAll();
     this.closeTimer = setTimeout(() => { this.closeTimer = null; if (!this.closed) { log.warn("openai_live.close_timeout", { session_id: this.sessionId }); this.ws?.close(); } }, 5000);
     this.closeTimer.unref?.();
   }
@@ -199,8 +248,9 @@ export class OpenAiLiveSession extends EventEmitter {
   private clearTimers() {
     if (this.greetingTimer) clearTimeout(this.greetingTimer);
     if (this.closeTimer) clearTimeout(this.closeTimer);
+    if (this.farewellTimer) clearTimeout(this.farewellTimer);
     for (const b of Object.values(this.buffers)) if (b.timer) clearTimeout(b.timer);
-    this.greetingTimer = this.closeTimer = null;
+    this.greetingTimer = this.closeTimer = this.farewellTimer = null;
   }
 
   private send(msg: Record<string, unknown>) {
@@ -217,9 +267,11 @@ export class OpenAiLiveSession extends EventEmitter {
       if (this.humanSpoke || this.greeted || this.closed) return;
       this.greeted = true;
       this.latency.greeting_fallback = true;
-      const opening = this.opts.openingLine ?? `Hi, this is ${this.opts.ownerName}'s AI assistant.`;
+      const opening = this.opts.openingLine
+        ? `follow this opening guidance: ${this.opts.openingLine}`
+        : `one short purpose-first sentence ("Hi, I'm calling for ${this.opts.ownerName} about ..."); do not introduce yourself as an AI or assistant unless asked`;
       this.send({ type: "session.instructions.append", event_id: "greeting_fallback", delegation_id: null,
-        content: `The person has picked up but has not said anything. Speak first now, in English: say "${opening}" in one short sentence, then pause and listen for their reply.` });
+        content: `The person has picked up but has not said anything. Speak first now, in English: ${opening}, then pause and listen for their reply.` });
       this.send({ type: "session.commentary.append", event_id: "greeting_fallback_go", delegation_id: null, content: "Begin the conversation now, following the instructions provided." });
       this.emit("greeting_fallback");
     }, this.opts.greetingWaitMs ?? 3000);
@@ -248,6 +300,7 @@ export class OpenAiLiveSession extends EventEmitter {
           // record the gap as an approximate turn latency (transcript arrival lags audio slightly).
           if (this.lastHumanTranscriptAt > this.agentTurnStartedAt && t - this.lastHumanTranscriptAt < 15_000) this.latency.turn_latencies_ms.push(t - this.lastHumanTranscriptAt);
           this.agentTurnStartedAt = t;
+          this.bargeInSent = false;
         }
         this.lastAgentAudioAt = t;
         this.greeted = true;
@@ -263,14 +316,14 @@ export class OpenAiLiveSession extends EventEmitter {
           if (this.greetingTimer) { clearTimeout(this.greetingTimer); this.greetingTimer = null; }
           this.emit("human_speech");
         }
-        // Barge-in signal for the bridge: human talking while agent audio was flowing recently.
-        if (t - this.lastAgentAudioAt < AGENT_SILENCE_GAP_MS && this.buffers.human.text === "") this.emit("barge_in");
         this.bufferTranscript("human", String(ev.delta ?? ""), ev.start_ms, ev.end_ms);
+        this.onHumanText(this.buffers.human.text, t);
         break;
       }
       case "session.output_transcript.delta":
         this.greeted = true;
         this.bufferTranscript("assistant", String(ev.delta ?? ""), ev.start_ms, ev.end_ms);
+        this.onAssistantText(this.buffers.assistant.text);
         break;
       case "session.delegation.created": {
         const id = String(ev.delegation?.id ?? ev.delegation_id ?? "");
@@ -344,10 +397,70 @@ export class OpenAiLiveSession extends EventEmitter {
     const text = b.text.replace(/\s+/g, " ").trim();
     b.text = "";
     b.lastEndMs = -1;
+    if (speaker === "assistant") this.assistantFarewellFlagged = false;
     if (!text) return;
+    if (speaker === "assistant") this.lastAssistantTurnText = text;
     this.pushTurn({ speaker, text, at: new Date(b.startedAt).toISOString() }, b.startedAt);
   }
   private flushAll() { this.flush("human"); this.flush("assistant"); }
+
+  /**
+   * Agent farewell: fire once per agent turn as soon as the running transcript's last sentence is a goodbye. The
+   * bridge re-checks agentIsClosing() when the audio has finished, so a "before we say goodbye, ..." question that
+   * matched early does not end the call.
+   */
+  private onAssistantText(runningText: string) {
+    if (this.opts.farewellDetection === false || this.assistantFarewellFlagged || this.closingStage !== "none") return;
+    if (!isClosingLine(runningText)) return;
+    this.assistantFarewellFlagged = true;
+    log.info("openai_live.farewell", { session_id: this.sessionId, speaker: "assistant", text: runningText.slice(-120) });
+    this.emit("farewell", "assistant", runningText);
+  }
+
+  /**
+   * Callee side. Every fragment is classified so the bridge can cancel a close when the person clearly has more to
+   * say. A callee goodbye arms the silence watchdog: if the agent then says nothing for farewellSilenceMs, the bridge
+   * hangs up instead of leaving a dead line (the agent's own goodbye, if it comes, is handled by onAssistantText).
+   */
+  private onHumanText(runningText: string, t: number) {
+    const kind: HumanUtteranceKind = classifyHumanUtterance(runningText);
+    this.emit("human_utterance", runningText, kind);
+    // Barge-in for the bridge: the person says something with content while agent audio is still flowing. Backchannels
+    // ("mm-hm", "okay") are not interruptions. Once per stretch of agent speech.
+    if (kind === "substantive" && !this.bargeInSent && t - this.lastAgentAudioAt < AGENT_SILENCE_GAP_MS) { this.bargeInSent = true; this.emit("barge_in"); }
+    if (this.opts.farewellDetection === false) return;
+    if (kind === "farewell") {
+      // Before the agent has said anything, a "goodbye" from the line is a voicemail greeting or an IVR, not a person
+      // leaving the conversation; the AMD / hangup callbacks own those cases.
+      if (this.lastAgentAudioAt === 0) return;
+      if (!this.humanFarewellAt) log.info("openai_live.farewell", { session_id: this.sessionId, speaker: "human", text: runningText.slice(-120) });
+      this.humanFarewellAt = t;
+      this.emit("farewell", "human", runningText);
+      this.armFarewellSilence();
+    } else if (kind === "substantive") {
+      // The person kept talking: they are not leaving after all.
+      this.humanFarewellAt = 0;
+      if (this.farewellTimer) { clearTimeout(this.farewellTimer); this.farewellTimer = null; }
+    }
+  }
+
+  private armFarewellSilence() {
+    if (this.farewellTimer || this.closingStage !== "none") return;
+    const base = this.opts.farewellSilenceMs ?? DEFAULT_FAREWELL_SILENCE_MS;
+    const check = () => {
+      this.farewellTimer = null;
+      if (!this.humanFarewellAt || this.closed || this.closingStage !== "none") return;
+      const quietSince = Math.max(this.humanFarewellAt, this.lastAgentAudioAt);
+      // A delegation in flight means the agent is fetching its closing line; allow one backend round trip more.
+      const limit = this.delegations.size > 0 ? base * 2 : base;
+      const remaining = limit - (this.now() - quietSince);
+      if (remaining > 0) { this.farewellTimer = setTimeout(check, Math.max(10, remaining)); this.farewellTimer.unref?.(); return; }
+      log.info("openai_live.farewell_silence", { session_id: this.sessionId, silence_ms: this.now() - quietSince });
+      this.emit("farewell_silence");
+    };
+    this.farewellTimer = setTimeout(check, Math.max(10, base));
+    this.farewellTimer.unref?.();
+  }
 
   private pushTurn(turn: TranscriptTurn, startedAt?: number) {
     const t = { ...turn, at: turn.at ?? new Date(this.now()).toISOString() };
@@ -378,12 +491,15 @@ export class OpenAiLiveSession extends EventEmitter {
           this.pushTurn({ speaker: "system", text: answer ? `[owner answered: ${answer}]` : "[owner did not answer in time]" });
           output = { answer: answer ?? "NO_ANSWER" }; break;
         }
-        case "end_call":
-          output = { ok: true };
-          this.sendToolOutput(callId, output);
+        case "end_call": {
+          this.sendToolOutput(callId, { ok: true });
+          // Let the backend finish its turn so the live model receives the goodbye line to say. Once the goodbye has
+          // already played (bridge is past the "goodbye" stage) nothing may prompt the model to speak again.
+          if (this.closingStage === "none") this.send({ type: "response.create", event_id: `continue_${randomUUID()}` });
           this.flushAll();
           await this.opts.hooks.onEndCall(String(args.reason));
           return;
+        }
         case "note_hold":
           this.pushTurn({ speaker: "system", text: `[hold: ${String(args.note)}]` });
           output = { ok: true }; break;
@@ -397,7 +513,8 @@ export class OpenAiLiveSession extends EventEmitter {
     // arrives after the session started closing is stale: keep it in the transcript, do not feed it back.
     if (this.closed || this.closeRequested) { log.info("openai_live.stale_tool_result", { session_id: this.sessionId, tool: name }); this.emit("stale_result", name, args); return; }
     this.sendToolOutput(callId, output);
-    this.send({ type: "response.create", event_id: `continue_${randomUUID()}` });
+    // After the goodbye has played the line is dropping; do not let the backend produce another spoken turn.
+    if (this.closingStage !== "done") this.send({ type: "response.create", event_id: `continue_${randomUUID()}` });
   }
 
   private sendToolOutput(callId: string, output: unknown) {

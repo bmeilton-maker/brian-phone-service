@@ -56,7 +56,7 @@ if (arg === "openai-live-session") {
   const session = new OpenAiLiveSession({
     instructions: buildLiveInstructions(env, { recipient_name: req.recipient_name }),
     backendInstructions: buildAgentInstructions(env, { recipient_name: req.recipient_name, realtime_hold_supported: true, hold_seconds: 45, tools: [...LIVE_TOOL_NAMES] }) + "\n" + backendInstructionsAddendum("Brian"),
-    ownerName: "Brian", voice: "marin", wsFactory: () => ws, greetingWaitMs: 50,
+    ownerName: "Brian", voice: "willow", wsFactory: () => ws, greetingWaitMs: 50,
     hooks: { onAskOwner: async (q) => { console.log(`\n[needs Brian] ${q}\n[auto-answer for demo] Tuesday`); return "Tuesday"; }, onEndCall: async (r) => console.log(`[hangup] reason=${r}`) },
   });
   session.on("turn", (t) => console.log(`${t.speaker}: ${t.text}`));

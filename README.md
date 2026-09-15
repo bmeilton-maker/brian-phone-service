@@ -67,7 +67,7 @@ Grok builds the envelope (`examples/call-envelope.json`); the service only ever 
 
 * Anything not explicitly `true` in `authority` is **NO**. No pre-approved spend unless `may_authorize_amount_up_to` is a number.
 * Personal details beyond the first name are disclosed only if listed in `may_disclose`.
-* When a real choice is not settled by `preferences`, the agent does not guess. xAI: it holds and asks Brian (`ask_owner`, up to `NEEDS_USER_HOLD_SECONDS`), then falls back to callback number + reference. Bland: takes callback + reference and returns `questions_for_brian`.
+* When a real choice is not settled by `preferences`, the agent does not guess. xAI / openai_live: it holds and asks Brian (`ask_owner`, up to `NEEDS_USER_HOLD_SECONDS`), then falls back to callback number + reference; on openai_live a reply that lands after the hold (chat latency) is still relayed if the call is live and the question is recent (`NEEDS_USER_LATE_ANSWER_SECONDS`). Bland: takes callback + reference and returns `questions_for_brian`.
 
 ### Normalized result
 
@@ -87,9 +87,10 @@ Extraction order: provider structured outcome (xAI `report_outcome` tool call) >
 | `XAI_EXTRACTION_MODEL` | `grok-4-fast` | Text model for transcript -> result. |
 | `XAI_SIP_NUMBER`, `XAI_WEBHOOK_SECRET` | | From registering a Direct SIP number (see docs/PROVISIONING.md). |
 | `OPENAI_API_KEY` | | Required for the openai_live provider. |
-| `OPENAI_LIVE_MODEL`, `OPENAI_LIVE_VOICE` | `gpt-live-1`, `marin` | Live voice model and voice. |
+| `OPENAI_LIVE_MODEL`, `OPENAI_LIVE_VOICE` | `gpt-live-1`, `willow` | Live voice model and voice (per-call `preferred_voice` overrides). |
 | `OPENAI_LIVE_BACKEND_MODEL` | `gpt-5.6-terra` | Responses-delegation backend that runs the tools (`gpt-5.6-luna` is cheaper). Optional `OPENAI_LIVE_BACKEND_REASONING_EFFORT`, `OPENAI_LIVE_BACKEND_SERVICE_TIER`. |
-| `OPENAI_LIVE_GREETING_WAIT_MS`, `OPENAI_LIVE_HANGUP_DELAY_MS`, `OPENAI_LIVE_CLEAR_ON_BARGE_IN`, `OPENAI_LIVE_STORE` | `3000`, `2500`, `false`, `false` | Greeting hold, goodbye drain before hangup, Twilio buffer clear on barge-in, keep a recording at OpenAI. |
+| `OPENAI_LIVE_GREETING_WAIT_MS`, `OPENAI_LIVE_HANGUP_DELAY_MS`, `OPENAI_LIVE_CLEAR_ON_BARGE_IN`, `OPENAI_LIVE_STORE` | `3000`, `3000`, `true`, `false` | Greeting hold, max wait for the goodbye to start before hangup, Twilio buffer clear on a substantive barge-in, keep a recording at OpenAI. |
+| `OPENAI_LIVE_FAREWELL_HANGUP`, `OPENAI_LIVE_FAREWELL_SILENCE_MS` | `true`, `2500` | Hang up on farewell intent (agent goodbye sentence; callee goodbye + agent silence), not only on `end_call`. |
 | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` | | Dials for xai (SIP leg first, then the human) and openai_live (callee + Media Stream). |
 | `TWILIO_VALIDATE_SIGNATURE` | `true` | Verify `X-Twilio-Signature` on webhooks. Rejections are logged as `twilio.webhook.rejected` with the expected URL. |
 | `TWILIO_RECONCILE_AFTER_MS` | `45000` | If no Twilio callback arrives for this long, `get_status` asks Twilio directly. |
@@ -97,7 +98,7 @@ Extraction order: provider structured outcome (xAI `report_outcome` tool call) >
 | `PHONE_SERVICE_TOKEN` | | Bearer token for the HTTP API. |
 | `DATA_DIR` | `./data` | Call records (`data/calls/<task_id>.json`). |
 | `DEFAULT_MAX_DURATION_SECONDS` | `600` | |
-| `NEEDS_USER_HOLD_SECONDS` | `45` | How long the xAI agent waits for Brian's answer. |
+| `NEEDS_USER_HOLD_SECONDS`, `NEEDS_USER_LATE_ANSWER_SECONDS` | `60`, `180` | How long the xAI / openai_live agent holds for Brian's answer; on openai_live an answer arriving after the hold (within the late window, call still live) is still handed to the agent mid-call. |
 
 The xai provider is registered only when every xAI/Twilio variable is present; otherwise the service logs `xai.not_configured` and keeps running on Bland. Likewise `openai_live` needs `OPENAI_API_KEY` + Twilio + `PUBLIC_BASE_URL` or it logs `openai_live.not_configured`.
 
@@ -131,9 +132,10 @@ Outbound path (xAI SIP is inbound-first; there is no documented "dial this PSTN 
 `src/providers/openai_live/`. Runbook with the chosen path, what is verified, and what to confirm on the first live call: **docs/OPENAI_LIVE_RUNBOOK.md**.
 
 1. `POST /Calls.json` `To={callee}` with inline TwiML `<Connect><Stream url="wss://PUBLIC/webhooks/openai-live/media"><Parameter name="task_id"/></Stream></Connect>`, async AMD, status callbacks on `/webhooks/openai-live/twilio/*`. One leg; our call_id = Twilio CallSid.
-2. Callee answers -> Twilio opens the Media Stream to us -> we open `wss://api.openai.com/v1/live/sessions`, send `session.start` (`audio/pcmu` 8 kHz, Responses delegation) and relay mu-law both ways unchanged. Two prompt layers per OpenAI's GPT-Live guides: the live model gets OpenAI's live-prompting template customized for Brian (`buildLiveInstructions`: calling on behalf of Brian, style, purpose, greeting hold, `Backchannel` / `Interruption` / `Delegation policy`); the backend model gets the full `buildAgentInstructions` envelope (context, preferences, authority, required outputs) plus the tool schemas.
+2. Callee answers -> Twilio opens the Media Stream to us -> we open `wss://api.openai.com/v1/live/sessions`, send `session.start` (`audio/pcmu` 8 kHz, Responses delegation) and relay mu-law both ways unchanged. Two prompt layers per OpenAI's GPT-Live guides: the live model gets OpenAI's live-prompting template customized for Brian (`buildLiveInstructions`: calling on behalf of Brian, style, purpose, greeting hold with a purpose-first opening and AI identity only when asked, `Backchannel` / `Interruption` / `Delegation policy`); the backend model gets the full `buildAgentInstructions` envelope (context, preferences, authority, required outputs) plus the tool schemas.
 3. Greeting hold: GPT-Live waits for the human natively; if nobody speaks for `OPENAI_LIVE_GREETING_WAIT_MS` we prompt it to open (`session.instructions.append` + `session.commentary.append`). Turn-taking and interruptions are handled by the full-duplex model (no VAD knobs).
-4. Tools arrive as `response.event -> response.output_item.done (function_call)`; this service executes them (it owns permissions and state) and answers with `response.item.create` + `response.create`. `end_call` lets the goodbye drain, hangs up via Twilio and finalizes locally. `ask_owner` holds for Brian (`needs_user`). Results that arrive after the session started closing are marked stale and not fed back.
+4. Tools arrive as `response.event -> response.output_item.done (function_call)`; this service executes them (it owns permissions and state) and answers with `response.item.create` + `response.create`. `ask_owner` holds for Brian (`needs_user`). Results that arrive after the session started closing are marked stale and not fed back.
+5. Hangup is owned by the bridge, not the model. `end_call` from the backend, the agent's own goodbye sentence, or a callee goodbye followed by agent silence all run the same sequence: let one goodbye finish, mute callee audio so the model cannot take another farewell turn, wait for Twilio's `mark` (audio really played), hang up via Twilio about half a second after the last goodbye word. Only then, with the callee gone, does the OpenAI session linger briefly to collect a `report_outcome` the backend was still producing, before the record is finalized. A callee who interrupts the goodbye with real content cancels the close; the next goodbye starts it again. Details and knobs in the runbook.
 5. Twilio `completed`, stream stop, `session.closed`, or a quiet-callback reconcile finalizes. `raw_provider_result.latency` records setup, first-audio, per-turn and delegation latencies for the A/B against xAI.
 
 Trial: `"provider": "openai_live"` per call (`examples/make_call_openai_live_override.json`), or `PHONE_PROVIDER=openai_live` process-wide. xAI and Bland stay available.
