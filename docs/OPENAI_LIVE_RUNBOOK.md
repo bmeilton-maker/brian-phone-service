@@ -132,6 +132,10 @@ Unrelated to farewells but the same "line stays open" family: if OpenAI drops th
 
 Kill switch: `OPENAI_LIVE_FAREWELL_HANGUP=false` returns to `end_call`-only hangup (still with the goodbye drain and mark).
 
+## needs_user and chat latency
+
+`ask_owner` holds the line for `NEEDS_USER_HOLD_SECONDS` (60). On the restaurant self-test Brian's reply came through chat after the hold had expired: `phone_answer_question` answered "no pending question" and the agent had already moved on to asking for a callback. Now, when the hold times out, the question is kept as `raw.last_question` and an answer that arrives within `NEEDS_USER_LATE_ANSWER_SECONDS` (180) while the call is still live (not closing, not ended) is handed to the live model directly: `session.instructions.append` ("Brian has now answered ... use it now, do not ask for a callback for this any more") + `session.commentary.append` ("Relay Brian's answer now"), the same mid-call path as the greeting fallback. The response is `{ delivered: true, message: "hold had timed out; answer handed to the agent mid-call" }`, the transcript gets `[owner answered after the hold: ...]`, `raw.late_answers` counts them, log `openai_live.late_answer_delivered`. Past the window: `question too old (late-answer window passed)`; after hangup: `call already ended`. The backend prompt tells the model that a late owner answer may arrive this way.
+
 ## Flip the default for the trial
 
 Per call: `"provider": "openai_live"` in `phone_make_call` (nothing else changes).

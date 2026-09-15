@@ -902,6 +902,55 @@ test("closing does not disturb needs_user: a hold released by Brian's answer sti
   assert.equal((await c.p.getOutcome("CA900")).state, "completed");
 });
 
+test("needs_user late answer: a reply that arrives after the hold timed out is still handed to the agent mid-call (restaurant self-test)", async () => {
+  const savedLate = config.needsUserLateAnswerSeconds;
+  try {
+    (config as { needsUserLateAnswerSeconds: number }).needsUserLateAnswerSeconds = 0.3;
+    const { p, ws } = await answeredCall({ realClock: true });
+    const sess = session(p);
+    await sess.handle(JSON.stringify({ type: "session.started", session: { id: "live_late" } }));
+    // Agent asks Brian for a phone number; the hold (50 ms in tests) expires before Brian's chat reply lands.
+    await sess.handle(JSON.stringify({ type: "response.event", delegation_id: "item_q", event: { type: "response.output_item.done", item: { type: "function_call", status: "completed", call_id: "q1", name: "ask_owner", arguments: JSON.stringify({ question: "What callback number should I give them?" }) } } }));
+    const timedOut = ws.sent.map((m) => JSON.parse(m)).find((m) => m.type === "response.item.create");
+    assert.equal(JSON.parse(timedOut.item.output).answer, "NO_ANSWER", "backend got NO_ANSWER at the hold timeout");
+    let st = await p.getOutcome("CA900");
+    assert.equal(st.state, "in_progress");
+    assert.equal(st.raw.pending_question, null);
+    const last = st.raw.last_question as { id: string; question: string; expired_at: string };
+    assert.equal(last.question, "What callback number should I give them?");
+    // Brian answers a moment later (still inside the late window): delivered to the live model directly.
+    assert.deepEqual(await p.answerQuestion("CA900", "wrong_id", "+16142034933"), { delivered: false, message: "question id mismatch (stale)" });
+    const r = await p.answerQuestion("CA900", last.id, "+16142034933");
+    assert.equal(r.delivered, true);
+    const msgs = ws.sent.map((m) => JSON.parse(m));
+    const instr = msgs.find((m) => m.type === "session.instructions.append" && m.event_id === `owner_late_answer_${last.id}`);
+    assert.ok(instr, "late answer appended as a mid-call instruction");
+    assert.match(instr.content, /Brian has now answered the question you asked earlier \("What callback number should I give them\?"\): "\+16142034933"/);
+    assert.match(instr.content, /Do not ask for a callback for this any more/);
+    assert.equal(instr.delegation_id, null);
+    const go = msgs.find((m) => m.type === "session.commentary.append" && m.event_id === `owner_late_answer_go_${last.id}`);
+    assert.match(go.content, /Relay Brian's answer to the person now/);
+    st = await p.getOutcome("CA900");
+    assert.match(st.transcript, /\[owner answered after the hold: \+16142034933\]/);
+    assert.equal(st.raw.last_question, null, "consumed");
+    assert.equal(st.raw.late_answers, 1);
+    assert.equal(st.state, "in_progress", "call continues");
+    // Nothing left to answer now.
+    assert.deepEqual(await p.answerQuestion("CA900", "", "again"), { delivered: false, message: "no pending question" });
+
+    // Too late: the window has passed.
+    await sess.handle(JSON.stringify({ type: "response.event", delegation_id: "item_q2", event: { type: "response.output_item.done", item: { type: "function_call", status: "completed", call_id: "q2", name: "ask_owner", arguments: JSON.stringify({ question: "Tue or Wed?" }) } } }));
+    await sleep(320);
+    assert.equal((await p.answerQuestion("CA900", "", "Tue")).message, "question too old (late-answer window passed)");
+    assert.equal(ws.sent.filter((m) => String(JSON.parse(m).event_id).startsWith("owner_late_answer_")).length, 2, "only the first late answer was delivered (instructions + commentary)");
+
+    // Not once the call is closing / over.
+    await sess.handle(JSON.stringify({ type: "response.event", delegation_id: "item_q3", event: { type: "function_call", status: "completed", call_id: "q3", name: "ask_owner", arguments: "{}" } }));
+    p.handleTwilioStatus({ CallSid: "CA900", CallStatus: "completed", CallDuration: "30" });
+    assert.equal((await p.answerQuestion("CA900", "", "Tue")).message, "call already ended");
+  } finally { (config as { needsUserLateAnswerSeconds: number }).needsUserLateAnswerSeconds = savedLate; }
+});
+
 test("prompts: live Closing rule + backend one-turn close (report_outcome, end_call, goodbye line) replace the goodbye-first ping-pong", async () => {
   const { ws } = await answeredCall();
   const s = JSON.parse(ws.sent[0]).session;

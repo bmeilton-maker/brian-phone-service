@@ -17,7 +17,10 @@ export const config = {
   dataDir: env("DATA_DIR", "./data"),
   logLevel: env("LOG_LEVEL", "info"),
   defaultMaxDurationSeconds: num("DEFAULT_MAX_DURATION_SECONDS", 600),
-  needsUserHoldSeconds: num("NEEDS_USER_HOLD_SECONDS", 45),
+  /** How long the agent holds the line for Brian's answer (ask_owner) before falling back to a callback. */
+  needsUserHoldSeconds: num("NEEDS_USER_HOLD_SECONDS", 60),
+  /** After the hold timed out, an answer that arrives within this window is still delivered to the agent mid-call. */
+  needsUserLateAnswerSeconds: num("NEEDS_USER_LATE_ANSWER_SECONDS", 180),
 
   bland: {
     apiKey: env("BLAND_API_KEY"),

@@ -54,6 +54,8 @@ interface LiveCall {
   turns: TranscriptTurn[];
   outcome: Record<string, unknown> | null;
   pendingQuestion: { id: string; question: string; options?: string[]; asked_at: string; resolve: (a: string | null) => void } | null;
+  /** The most recent ask_owner whose hold timed out; a late answer within NEEDS_USER_LATE_ANSWER_SECONDS is still delivered. */
+  lastQuestion: { id: string; question: string; asked_at: string; expired_at: number } | null;
   closing: { trigger: CloseTrigger; cancelled: boolean; done: Promise<void> } | null;
   closeCancels: number;
   /** Twilio `mark` echoes we are waiting for (name -> resolver). */
@@ -163,7 +165,7 @@ export class OpenAiLiveProvider implements PhoneProvider {
     log.info("twilio.dialed", { task_id: input.task_id, call_sid: sid, path: "media_streams", callee: input.phone_number });
     this.calls.set(sid, {
       task_id: input.task_id, twilio_sid: sid, input, state: "dialing", started_at: this.now(), answered_at: null, hangup_at: null, ended_at: null, collecting: false, last_status_at: this.now(), reconciling: false,
-      human_answered: null, voicemail: null, error: null, session: null, stream: null, turns: [], outcome: null, pendingQuestion: null,
+      human_answered: null, voicemail: null, error: null, session: null, stream: null, turns: [], outcome: null, pendingQuestion: null, lastQuestion: null,
       closing: null, closeCancels: 0, marks: new Map(),
       raw: { provider: "openai_live", twilio: raw, model: config.openaiLive.model, backend_model: config.openaiLive.backendModel },
     });
@@ -451,8 +453,15 @@ export class OpenAiLiveProvider implements PhoneProvider {
       const id = `q_${this.now()}`;
       // Leaving needs_user must not overwrite a final state if the call ended while holding.
       const release = () => { c.pendingQuestion = null; if (!c.ended_at) c.state = "in_progress"; };
-      const timer = setTimeout(() => { if (c.pendingQuestion?.id === id) { release(); resolve(null); } }, config.needsUserHoldSeconds * 1000);
-      c.pendingQuestion = { id, question, options, asked_at: new Date(this.now()).toISOString(), resolve: (a) => { clearTimeout(timer); release(); resolve(a); } };
+      const asked_at = new Date(this.now()).toISOString();
+      const timer = setTimeout(() => {
+        if (c.pendingQuestion?.id !== id) return;
+        // Brian may still be typing: remember the question so a late answer can be handed to the agent mid-call.
+        c.lastQuestion = { id, question, asked_at, expired_at: this.now() };
+        log.info("openai_live.needs_user_timeout", { task_id: c.task_id, question_id: id, late_answer_window_s: config.needsUserLateAnswerSeconds });
+        release(); resolve(null);
+      }, config.needsUserHoldSeconds * 1000);
+      c.pendingQuestion = { id, question, options, asked_at, resolve: (a) => { clearTimeout(timer); release(); resolve(a); } };
       c.state = "needs_user";
       log.info("openai_live.needs_user", { task_id: c.task_id, question, options, hold_seconds: config.needsUserHoldSeconds });
     });
@@ -460,10 +469,30 @@ export class OpenAiLiveProvider implements PhoneProvider {
 
   async answerQuestion(call_id: string, question_id: string, answer: string) {
     const c = this.calls.get(call_id);
-    if (!c?.pendingQuestion) return { delivered: false, message: "no pending question" };
-    if (question_id && c.pendingQuestion.id !== question_id) return { delivered: false, message: "question id mismatch (stale)" };
-    c.pendingQuestion.resolve(answer);
-    return { delivered: true };
+    if (!c) return { delivered: false, message: "unknown call" };
+    if (c.pendingQuestion) {
+      if (question_id && c.pendingQuestion.id !== question_id) return { delivered: false, message: "question id mismatch (stale)" };
+      c.pendingQuestion.resolve(answer);
+      return { delivered: true };
+    }
+    if (c.ended_at || c.hangup_at) return { delivered: false, message: "call already ended" };
+    // The hold timed out before Brian's reply came through chat. If the question is recent and the call is still live,
+    // hand the answer to the live model directly (same mid-call instruction path as the greeting fallback) instead of
+    // letting the agent finish on a callback request.
+    const late = c.lastQuestion;
+    const s = c.session;
+    if (late && s?.started && !s.closed && s.closingStage === "none" && this.now() - late.expired_at <= config.needsUserLateAnswerSeconds * 1000) {
+      if (question_id && late.id !== question_id) return { delivered: false, message: "question id mismatch (stale)" };
+      const owner = c.input.envelope.identity.owner_name;
+      s.appendInstructions(`owner_late_answer_${late.id}`, `${owner} has now answered the question you asked earlier ("${late.question}"): "${answer}". Use this answer now: tell the person, and continue the call with it. Do not ask for a callback for this any more.`);
+      s.appendCommentary(`owner_late_answer_go_${late.id}`, `Relay ${owner}'s answer to the person now.`);
+      s.noteSystem(`[owner answered after the hold: ${answer}]`);
+      c.lastQuestion = null;
+      c.raw.late_answers = ((c.raw.late_answers as number | undefined) ?? 0) + 1;
+      log.info("openai_live.late_answer_delivered", { task_id: c.task_id, question_id: late.id, seconds_after_timeout: Math.round((this.now() - late.expired_at) / 1000) });
+      return { delivered: true, message: "hold had timed out; answer handed to the agent mid-call" };
+    }
+    return { delivered: false, message: late ? "question too old (late-answer window passed)" : "no pending question" };
   }
 
   private end(c: LiveCall, state: CallState, error: string | null) {
@@ -523,6 +552,7 @@ export class OpenAiLiveProvider implements PhoneProvider {
         answered_at: c.answered_at ? new Date(c.answered_at).toISOString() : null, ended_at: c.ended_at ? new Date(c.ended_at).toISOString() : null,
         live_usage_seconds: usage, latency: c.session?.latency ?? null,
         pending_question: c.pendingQuestion ? { id: c.pendingQuestion.id, question: c.pendingQuestion.question, options: c.pendingQuestion.options, asked_at: c.pendingQuestion.asked_at } : null,
+        last_question: c.lastQuestion ? { id: c.lastQuestion.id, question: c.lastQuestion.question, asked_at: c.lastQuestion.asked_at, expired_at: new Date(c.lastQuestion.expired_at).toISOString() } : null,
       },
     };
   }
