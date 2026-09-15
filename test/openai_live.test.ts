@@ -608,11 +608,15 @@ test("agent goodbye ends the call without any end_call: one farewell, callee aud
   assert.equal(c.tw.hangups(), 0);
   // The live model closes on its own and never delegates (the trial failure mode).
   await c.agentTurn("Great, you're all set for Tuesday at 10. Thanks Maria, goodbye!", 80, 8000);
+  const lastGoodbyeAudio = Date.now();
   assert.equal(c.sess.closingStage, "goodbye", "the farewell sentence starts the close while the audio is still playing");
   assert.equal(c.tw.hangups(), 0, "not hung up mid-sentence");
-  assert.equal(await c.untilEnded(), true, "call ends by itself");
-  const out = await c.p.getOutcome("CA900");
+  while (Date.now() - lastGoodbyeAudio < 1000 && c.tw.hangups() === 0) await sleep(5);
+  const tail = Date.now() - lastGoodbyeAudio;
   assert.equal(c.tw.hangups(), 1);
+  assert.ok(tail >= FAST_CLOSE.goodbyeQuietMs - 5 && tail < FAST_CLOSE.goodbyeQuietMs + 150, `hangup ~quiet + mark echo after the last goodbye frame (${tail} ms)`);
+  assert.equal(await c.untilEnded(), true, "record finalized after the (empty) outcome window");
+  const out = await c.p.getOutcome("CA900");
   assert.equal(out.state, "completed");
   assert.equal(out.raw.close_trigger, "agent_farewell");
   assert.equal(out.raw.end_reason, "agent_said_goodbye");
@@ -629,24 +633,56 @@ test("agent goodbye ends the call without any end_call: one farewell, callee aud
   assert.match(out.transcript, /assistant: Great, you're all set for Tuesday at 10\. Thanks Maria, goodbye!/);
 });
 
-test("agent goodbye with the outcome still being recorded: waits for report_outcome, does not let the backend speak again", async () => {
+test("agent goodbye with the outcome still being recorded: hangs up promptly anyway, then collects report_outcome from the lingering session", async () => {
   const c = await midConversation();
   await c.delegation("item_d1");
+  const goodbyeDone = Date.now() + 60;
   await c.agentTurn("Perfect, Tuesday at 10 it is. Goodbye!", 60, 8000);
-  await sleep(FAST_CLOSE.goodbyeQuietMs + 60);
-  assert.equal(c.sess.closingStage, "done", "goodbye finished; waiting for the in-flight delegation before hanging up");
-  assert.equal(c.tw.hangups(), 0);
+  // Phone tail: hangup lands ~quiet + mark echo after the last goodbye frame, not after the backend.
+  const t0 = Date.now();
+  while (Date.now() - t0 < 1000 && c.tw.hangups() === 0) await sleep(5);
+  const tail = Date.now() - goodbyeDone;
+  assert.equal(c.tw.hangups(), 1, "Twilio hung up without waiting for the delegation");
+  assert.ok(tail < FAST_CLOSE.goodbyeQuietMs + 150, `tail after the goodbye stayed short (${tail} ms)`);
+  assert.ok(c.media.events().includes("mark"));
+  let out = await c.p.getOutcome("CA900");
+  assert.equal(out.ended, false, "record not final yet: collecting the outcome from the open session");
+  assert.equal(typeof out.raw.hangup_at, "string");
+  assert.ok(!c.sentTypesNow().includes("session.close"), "OpenAI session kept open for the backend result");
+  // Twilio's completed callback and the stream stop arrive right after our hangup; neither finalizes early.
+  c.p.handleTwilioStatus({ CallSid: "CA900", CallStatus: "completed", CallDuration: "41" });
+  c.media.twilio({ event: "stop" });
+  await sleep(20);
+  assert.equal((await c.p.getOutcome("CA900")).ended, false);
+  assert.ok(!c.sentTypesNow().includes("session.close"));
   const before = c.sentTypesNow().filter((t) => t === "response.create").length;
   await c.tool("item_d1", "call_ro", "report_outcome", c.outcomeArgs);
   assert.equal(c.sentTypesNow().filter((t) => t === "response.create").length, before, "backend response is not continued once the goodbye has played (no second goodbye)");
   assert.equal(await c.untilEnded(), true);
-  const out = await c.p.getOutcome("CA900");
-  assert.equal(out.provider_extraction?.status, "success", "outcome landed before the hangup");
+  out = await c.p.getOutcome("CA900");
+  assert.equal(out.state, "completed");
+  assert.equal(out.provider_extraction?.status, "success", "outcome landed after the hangup and is in the result");
+  assert.deepEqual(out.raw.stale_results, undefined, "collected result is not stale");
+  assert.equal(out.duration_seconds, 41, "Twilio duration from the callback that arrived during collection");
+  assert.ok(c.sentTypesNow().includes("session.close"), "session closed once the outcome was in");
   assert.equal(c.tw.hangups(), 1);
   // late end_call from the same backend turn is harmless and only refines the reason
   await c.tool("item_d1", "call_ec", "end_call", { reason: "objective_complete" });
   assert.equal(c.tw.hangups(), 1);
   assert.equal((await c.p.getOutcome("CA900")).raw.end_reason, "objective_complete");
+
+  // Backend never answers: the record is finalized after the (longer, delegation-in-flight) collect window, outcome null.
+  const d = await midConversation();
+  await d.delegation("item_dz");
+  await d.agentTurn("All set. Goodbye!", 40, 8000);
+  const t1 = Date.now();
+  assert.equal(await d.untilEnded(1500), true);
+  const took = Date.now() - t1;
+  assert.ok(took >= FAST_CLOSE.delegationWaitMs - 20, `waited the delegation window after hangup (${took} ms)`);
+  const dout = await d.p.getOutcome("CA900");
+  assert.equal(dout.provider_extraction, null);
+  assert.equal(dout.state, "completed");
+  assert.equal(typeof dout.raw.collect_ms, "number");
 });
 
 test("end_call before the goodbye is spoken: backend response is continued, goodbye audio is allowed to start and finish, then hangup", async () => {
@@ -748,6 +784,31 @@ test("callee says goodbye and the agent stays silent: hang up after OPENAI_LIVE_
   assert.ok(took >= config.openaiLive.farewellSilenceMs - 5, `waited for the agent first (${took} ms)`);
   const out = await c.p.getOutcome("CA900");
   assert.equal(out.raw.close_trigger, "human_farewell"); assert.equal(out.raw.end_reason, "callee_said_goodbye"); assert.equal(c.tw.hangups(), 1);
+});
+
+test("callee goodbye while the backend is working: watchdog allows one round trip more; agent speaking at the deadline is allowed to finish", async () => {
+  const c = await midConversation();
+  await c.delegation("item_slow");
+  const t0 = Date.now();
+  await c.human("Okay, thanks, bye!", 7000);
+  await sleep(config.openaiLive.farewellSilenceMs + 40);
+  assert.equal(c.tw.hangups(), 0, "delegation in flight: not yet");
+  assert.equal(await c.untilEnded(1200), true);
+  const took = Date.now() - t0;
+  assert.ok(took >= config.openaiLive.farewellSilenceMs * 2 - 10, `doubled window (${took} ms)`);
+  assert.equal((await c.p.getOutcome("CA900")).raw.close_trigger, "human_farewell");
+
+  // Agent starts a (non-farewell) sentence just as the silence deadline hits: the close lets that audio finish.
+  const d = await midConversation();
+  await d.human("Alright, bye now.", 7000);
+  await sleep(config.openaiLive.farewellSilenceMs - 30);
+  const speaking = d.agentTurn("One last thing, your confirmation code is 4471.", 150, 9000);
+  await sleep(80);
+  assert.equal(d.tw.hangups(), 0, "not cut mid-sentence");
+  await speaking;
+  assert.equal(await d.untilEnded(), true);
+  assert.equal(d.tw.hangups(), 1);
+  assert.ok((await d.p.getOutcome("CA900")).transcript.includes("confirmation code is 4471"));
 });
 
 test("callee goodbye answered by the agent's goodbye takes the agent-farewell path once; callee continuing cancels the silence watchdog", async () => {
