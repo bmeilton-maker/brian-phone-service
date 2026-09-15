@@ -645,6 +645,7 @@ test("agent goodbye with the outcome still being recorded: hangs up promptly any
   assert.equal(c.tw.hangups(), 1, "Twilio hung up without waiting for the delegation");
   assert.ok(tail < FAST_CLOSE.goodbyeQuietMs + 150, `tail after the goodbye stayed short (${tail} ms)`);
   assert.ok(c.media.events().includes("mark"));
+  assert.equal(c.media.closed, true, "media socket closed with the hangup (ends the <Connect><Stream> call immediately)");
   let out = await c.p.getOutcome("CA900");
   assert.equal(out.ended, false, "record not final yet: collecting the outcome from the open session");
   assert.equal(typeof out.raw.hangup_at, "string");
