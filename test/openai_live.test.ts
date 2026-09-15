@@ -8,8 +8,9 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import WebSocket from "ws";
 import { createHttpServer } from "../src/server/http.js";
-import { OpenAiLiveProvider, dialForm, mediaStreamTwiml, type MediaWsLike } from "../src/providers/openai_live/index.js";
+import { OpenAiLiveProvider, dialForm, mediaStreamTwiml, type CloseTiming, type MediaWsLike } from "../src/providers/openai_live/index.js";
 import { OpenAiLiveSession, LIVE_TOOL_NAMES } from "../src/providers/openai_live/live.js";
+import { classifyHumanUtterance, containsFarewell, isClosingLine } from "../src/providers/openai_live/farewell.js";
 import { TwilioClient, type TwilioHttp } from "../src/providers/xai/twilio.js";
 import { FakeWs } from "../src/providers/xai/fakews.js";
 import { buildEnvelope } from "../src/envelope.js";
@@ -19,7 +20,7 @@ import { CallStore } from "../src/store.js";
 import type { NormalizedResult } from "../src/types.js";
 
 // Configure openai_live for tests (no network is ever hit; Twilio, the OpenAI socket and the Twilio media socket are faked).
-Object.assign(config.openaiLive, { apiKey: "sk-test-key", greetingWaitMs: 60, hangupDelayMs: 0, clearOnBargeIn: false, store: false });
+Object.assign(config.openaiLive, { apiKey: "sk-test-key", greetingWaitMs: 60, hangupDelayMs: 0, store: false, farewellHangup: true, farewellSilenceMs: 120 });
 Object.assign(config.twilio, { accountSid: "ACtest", authToken: "tok", fromNumber: "+16145550000" });
 (config as { publicBaseUrl: string }).publicBaseUrl = "https://example.test";
 (config as { needsUserHoldSeconds: number }).needsUserHoldSeconds = 0.05;
@@ -29,9 +30,17 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 class FakeMediaWs extends EventEmitter implements MediaWsLike {
   sent: string[] = [];
   closed = false;
-  send(data: string) { this.sent.push(data); }
+  /** Echo `mark` frames back like Twilio does once the audio queued before the mark has played. */
+  echoMarks = false;
+  markDelayMs = 0;
+  send(data: string) {
+    this.sent.push(data);
+    const m = JSON.parse(data);
+    if (m.event === "mark" && this.echoMarks) setTimeout(() => this.twilio({ event: "mark", streamSid: m.streamSid, mark: { name: m.mark.name } }), this.markDelayMs);
+  }
   close() { if (!this.closed) { this.closed = true; this.emit("close"); } }
   twilio(frame: Record<string, unknown>) { this.emit("message", JSON.stringify(frame)); }
+  events() { return this.sent.map((m) => JSON.parse(m).event as string); }
 }
 
 function fakeTwilio(remote: { status: string; duration?: string } = { status: "completed", duration: "60" }) {
@@ -48,14 +57,29 @@ function fakeTwilio(remote: { status: string; duration?: string } = { status: "c
   return { client: new TwilioClient(http), forms, hangups: () => hangups, fetches: () => fetches };
 }
 
-function makeProvider(remote?: { status: string; duration?: string }) {
-  const tw = fakeTwilio(remote);
+interface ProviderOpts {
+  remote?: { status: string; duration?: string };
+  /** Use the wall clock (the hangup sequence polls real timers). Default: a manually ticked fake clock. */
+  realClock?: boolean;
+  closeTiming?: Partial<CloseTiming>;
+}
+
+function makeProvider(remote?: { status: string; duration?: string }, opts: ProviderOpts = {}) {
+  const tw = fakeTwilio(remote ?? opts.remote);
   const ws = new FakeWs();
   const wsCalls: { url: string; headers: Record<string, string> }[] = [];
   let now = 1_000_000;
-  const p = new OpenAiLiveProvider({ twilio: tw.client, wsFactory: (url, headers) => { wsCalls.push({ url, headers }); return ws; }, now: () => now });
+  const p = new OpenAiLiveProvider({
+    twilio: tw.client, wsFactory: (url, headers) => { wsCalls.push({ url, headers }); return ws; },
+    now: opts.realClock ? undefined : () => now,
+    // No Twilio mark echo unless a test opts in (the default FakeMediaWs never answers marks).
+    closeTiming: { playoutWaitMs: 0, ...(opts.closeTiming ?? {}) },
+  });
   return { p, ws, wsCalls, tw, tick: (ms: number) => { now += ms; } };
 }
+
+/** Fast hangup-sequence timings for the closing tests (poll interval = quiet / 4 = 15 ms). */
+const FAST_CLOSE: CloseTiming = { goodbyeStartWaitMs: 150, goodbyeQuietMs: 60, goodbyeMaxMs: 1500, outcomeWaitMs: 80, delegationWaitMs: 300, playoutWaitMs: 200, maxCancels: 2 };
 
 const input = () => ({
   task_id: "task_l1", envelope: buildEnvelope({ recipient_name: "Riverside Dental", phone_number: "+16145550100", objective: "Book cleaning", required_outputs: ["appointment date"] }),
@@ -66,8 +90,8 @@ const sentTypes = (ws: FakeWs) => ws.sent.map((m) => JSON.parse(m).type as strin
 const session = (p: OpenAiLiveProvider) => (p as unknown as { calls: Map<string, { session: OpenAiLiveSession }> }).calls.get("CA900")!.session;
 
 /** Dial, answer, open the media stream + OpenAI socket, and get the session to `started`. */
-async function answeredCall(opts: { remote?: { status: string; duration?: string } } = {}) {
-  const ctx = makeProvider(opts.remote);
+async function answeredCall(opts: ProviderOpts = {}) {
+  const ctx = makeProvider(opts.remote, opts);
   await ctx.p.startCall(input());
   const media = new FakeMediaWs();
   ctx.p.attachMediaStream(media);
@@ -75,6 +99,34 @@ async function answeredCall(opts: { remote?: { status: string; duration?: string
   media.twilio({ event: "start", start: { streamSid: "MZ1", callSid: "CA900", customParameters: { task_id: "task_l1" }, mediaFormat: { encoding: "audio/x-mulaw", sampleRate: 8000, channels: 1 } } });
   ctx.ws.emit("open");
   return { ...ctx, media };
+}
+
+/**
+ * A call in the middle of a conversation, on the wall clock with FAST_CLOSE timings: session started, the callee has
+ * spoken, the agent has answered once. Twilio echoes marks. Returns helpers that emit GPT-Live server events.
+ */
+async function midConversation(closeTiming: Partial<CloseTiming> = {}) {
+  const ctx = await answeredCall({ realClock: true, closeTiming: { ...FAST_CLOSE, ...closeTiming } });
+  ctx.media.echoMarks = true;
+  const sess = session(ctx.p);
+  await sess.handle(JSON.stringify({ type: "session.started", session: { id: "live_close" } }));
+  const human = (text: string, startMs = 1000) => sess.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: text, start_ms: startMs, end_ms: startMs + 500 }));
+  const agentSays = (text: string, startMs = 2000) => sess.handle(JSON.stringify({ type: "session.output_transcript.delta", delta: text, start_ms: startMs, end_ms: startMs + 500 }));
+  const agentAudio = () => sess.handle(JSON.stringify({ type: "session.output_audio.delta", delta: "QUJD" }));
+  /** Agent speaks for `ms`: first audio frame, the transcript text right behind it, then audio every 10 ms until `ms`. */
+  const agentTurn = async (text: string, ms = 80, startMs = 5000) => { const t0 = Date.now(); await agentAudio(); await agentSays(text, startMs); while (Date.now() - t0 < ms) { await sleep(10); await agentAudio(); } };
+  const calleeAudio = (payload = "AAAA") => ctx.media.twilio({ event: "media", media: { track: "inbound", payload } });
+  const delegation = (id: string) => sess.handle(JSON.stringify({ type: "session.delegation.created", delegation: { id, type: "delegation", target: "responses" }, response_id: `resp_${id}` }));
+  const tool = (delegationId: string, callId: string, name: string, args: Record<string, unknown>) => sess.handle(JSON.stringify({ type: "response.event", delegation_id: delegationId, event: { type: "response.output_item.done", item: { type: "function_call", status: "completed", call_id: callId, name, arguments: JSON.stringify(args) } } }));
+  const outcomeArgs = { status: "success", summary: "Booked Tuesday 10.", human_or_business_reached: "receptionist", results: { "appointment date": "Tuesday" }, commitments_made: [], financial_commitments: [], dates_and_times: ["Tuesday 10:00"], confirmation_numbers: [], follow_up_required: false, follow_up: null, questions_for_brian: [] };
+  await human("Riverside Dental, this is Maria.", 800);
+  await agentTurn("Hi, this is Brian's AI assistant. I'd like to book a cleaning.", 40, 2500);
+  await human("Sure, Tuesday at 10 works.", 6000);
+  await sleep(FAST_CLOSE.goodbyeQuietMs + 20); // the agent's last audio is stale: a trigger now is not "mid-goodbye"
+  /** Wait until the call has ended (or `ms` elapsed). */
+  const untilEnded = async (ms = 1500) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if ((await ctx.p.getOutcome("CA900")).ended) return true; await sleep(10); } return false; };
+  const sentTypesNow = () => sentTypes(ctx.ws);
+  return { ...ctx, sess, human, agentSays, agentAudio, agentTurn, calleeAudio, delegation, tool, outcomeArgs, untilEnded, sentTypesNow };
 }
 
 test("openai_live provider name is accepted by config", () => {
@@ -292,24 +344,29 @@ test("greeting wait is not armed before session.started; human speech before the
   assert.notEqual((await p.getOutcome("CA900")).raw.greeting_fallback, true);
 });
 
-test("barge-in: Twilio clear is sent only when OPENAI_LIVE_CLEAR_ON_BARGE_IN is on", async () => {
-  const saved = config.openaiLive.clearOnBargeIn;
-  try {
-    (config.openaiLive as { clearOnBargeIn: boolean }).clearOnBargeIn = true;
-    const { p, media } = await answeredCall();
-    const sess = session(p);
-    await sess.handle(JSON.stringify({ type: "session.started", session: { id: "live_3" } }));
-    await sess.handle(JSON.stringify({ type: "session.output_audio.delta", delta: "AAAA" }));
-    await sess.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "Wait", start_ms: 0, end_ms: 100 }));
-    const events = media.sent.map((m) => JSON.parse(m).event);
-    assert.deepEqual(events, ["media", "clear"]);
-  } finally { (config.openaiLive as { clearOnBargeIn: boolean }).clearOnBargeIn = saved; }
+test("barge-in: Twilio clear drops the queued agent audio on a substantive interruption (default on), not on a backchannel; off with OPENAI_LIVE_CLEAR_ON_BARGE_IN=false", async () => {
+  assert.equal(config.openaiLive.clearOnBargeIn, true, "default is on");
   const { p, media } = await answeredCall();
   const sess = session(p);
-  await sess.handle(JSON.stringify({ type: "session.started", session: { id: "live_4" } }));
+  await sess.handle(JSON.stringify({ type: "session.started", session: { id: "live_3" } }));
   await sess.handle(JSON.stringify({ type: "session.output_audio.delta", delta: "AAAA" }));
-  await sess.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "Wait", start_ms: 0, end_ms: 100 }));
-  assert.deepEqual(media.sent.map((m) => JSON.parse(m).event), ["media"], "default: GPT-Live handles the interruption itself");
+  await sess.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "Mm-hmm,", start_ms: 0, end_ms: 100 }));
+  assert.deepEqual(media.events(), ["media"], "a backchannel is not an interruption");
+  await sess.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: " wait, which day?", start_ms: 100, end_ms: 600 }));
+  assert.deepEqual(media.events(), ["media", "clear"], "real content while the agent is talking: stop the tail");
+  await sess.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: " I mean Tuesday.", start_ms: 600, end_ms: 900 }));
+  assert.deepEqual(media.events(), ["media", "clear"], "one clear per stretch of agent speech");
+
+  const saved = config.openaiLive.clearOnBargeIn;
+  try {
+    (config.openaiLive as { clearOnBargeIn: boolean }).clearOnBargeIn = false;
+    const off = await answeredCall();
+    const s2 = session(off.p);
+    await s2.handle(JSON.stringify({ type: "session.started", session: { id: "live_4" } }));
+    await s2.handle(JSON.stringify({ type: "session.output_audio.delta", delta: "AAAA" }));
+    await s2.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "Wait", start_ms: 0, end_ms: 100 }));
+    assert.deepEqual(off.media.events(), ["media"], "off: GPT-Live handles the interruption itself");
+  } finally { (config.openaiLive as { clearOnBargeIn: boolean }).clearOnBargeIn = saved; }
 });
 
 test("media stream for an unknown CallSid is refused; a second stream for the same call is refused", async () => {
@@ -528,4 +585,242 @@ test("openai_live through PhoneService with per-call provider override; bland re
   assert.equal(result.provider, "openai_live");
   assert.ok(["partial", "failed"].includes(result.status)); // no transcript, no tool outcome -> not success
   s.shutdown();
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Hangup on farewell (Sep 15 2026 trial: goodbye did not end the call; the agent kept taking farewell turns)
+// ---------------------------------------------------------------------------------------------------------------
+
+test("farewell helpers: closing lines, false positives, callee utterance classes", () => {
+  for (const s of ["Goodbye!", "Thanks Maria, you're all set for Tuesday at 10. Goodbye.", "Have a great day.", "Take care, bye now.", "Bye-bye!", "Talk to you soon.", "Alright, see you Tuesday.", "Thank you so much, have a good one!"]) assert.equal(isClosingLine(s), true, s);
+  for (const s of ["Before we say goodbye, which day works best?", "Is Tuesday a good day for that?", "We'll take care of it for you.", "I see you have an appointment on file.", "I'd like to buy a plan.", "Anything else before we say goodbye?", "Goodbye is such a hard word. What time was it again?", ""]) assert.equal(isClosingLine(s), false, s);
+  assert.equal(containsFarewell("Before we say goodbye, which day works?"), true, "containsFarewell is the loose check; isClosingLine looks at the last sentence");
+  assert.equal(containsFarewell("we take care of billing"), false);
+  for (const s of ["Bye!", "okay bye", "Thanks, you too, bye bye.", "Have a good day", "alright take care", "Thank you so much, goodbye.", "Sure, Tuesday at 10 works. Alright, thanks, bye!"]) assert.equal(classifyHumanUtterance(s), "farewell", s);
+  for (const s of ["okay", "Yeah.", "mm-hmm", "Thanks so much!", "Sounds good.", "perfect, thank you", ""]) assert.equal(classifyHumanUtterance(s), "ack", s);
+  for (const s of ["Wait", "Hold on, what time was that?", "Actually one more thing", "bye, wait, which Tuesday?", "No, that's wrong", "Okay bye oh wait actually can you also ask about parking", "Bye. Actually, hold on."]) assert.equal(classifyHumanUtterance(s), "substantive", s);
+  assert.equal(isClosingLine("Goodbye, Maria!"), true, "a name after the goodbye is fine");
+  assert.equal(isClosingLine("Goodbye, and let me know if anything changes with the schedule"), false, "a goodbye followed by more content is not the close");
+});
+
+test("agent goodbye ends the call without any end_call: one farewell, callee audio muted, Twilio mark confirms playout, then hangup", async () => {
+  const c = await midConversation();
+  assert.equal(c.tw.hangups(), 0);
+  // The live model closes on its own and never delegates (the trial failure mode).
+  await c.agentTurn("Great, you're all set for Tuesday at 10. Thanks Maria, goodbye!", 80, 8000);
+  assert.equal(c.sess.closingStage, "goodbye", "the farewell sentence starts the close while the audio is still playing");
+  assert.equal(c.tw.hangups(), 0, "not hung up mid-sentence");
+  assert.equal(await c.untilEnded(), true, "call ends by itself");
+  const out = await c.p.getOutcome("CA900");
+  assert.equal(c.tw.hangups(), 1);
+  assert.equal(out.state, "completed");
+  assert.equal(out.raw.close_trigger, "agent_farewell");
+  assert.equal(out.raw.end_reason, "agent_said_goodbye");
+  assert.equal(typeof out.raw.goodbye_done_ms, "number");
+  const events = c.media.events();
+  assert.ok(events.includes("mark"), "playout mark sent to Twilio before hanging up");
+  assert.ok(events.lastIndexOf("mark") > events.lastIndexOf("media"), "mark queued after the last goodbye audio frame");
+  assert.ok(c.sentTypesNow().includes("session.close"));
+  assert.equal(c.sess.inputMuted, true);
+  // Nothing after the goodbye can reach the model: the callee's "bye" is not forwarded, so no second farewell turn.
+  const appends = c.sentTypesNow().filter((t) => t === "session.input_audio.append").length;
+  c.calleeAudio("BBBB");
+  assert.equal(c.sentTypesNow().filter((t) => t === "session.input_audio.append").length, appends);
+  assert.match(out.transcript, /assistant: Great, you're all set for Tuesday at 10\. Thanks Maria, goodbye!/);
+});
+
+test("agent goodbye with the outcome still being recorded: waits for report_outcome, does not let the backend speak again", async () => {
+  const c = await midConversation();
+  await c.delegation("item_d1");
+  await c.agentTurn("Perfect, Tuesday at 10 it is. Goodbye!", 60, 8000);
+  await sleep(FAST_CLOSE.goodbyeQuietMs + 60);
+  assert.equal(c.sess.closingStage, "done", "goodbye finished; waiting for the in-flight delegation before hanging up");
+  assert.equal(c.tw.hangups(), 0);
+  const before = c.sentTypesNow().filter((t) => t === "response.create").length;
+  await c.tool("item_d1", "call_ro", "report_outcome", c.outcomeArgs);
+  assert.equal(c.sentTypesNow().filter((t) => t === "response.create").length, before, "backend response is not continued once the goodbye has played (no second goodbye)");
+  assert.equal(await c.untilEnded(), true);
+  const out = await c.p.getOutcome("CA900");
+  assert.equal(out.provider_extraction?.status, "success", "outcome landed before the hangup");
+  assert.equal(c.tw.hangups(), 1);
+  // late end_call from the same backend turn is harmless and only refines the reason
+  await c.tool("item_d1", "call_ec", "end_call", { reason: "objective_complete" });
+  assert.equal(c.tw.hangups(), 1);
+  assert.equal((await c.p.getOutcome("CA900")).raw.end_reason, "objective_complete");
+});
+
+test("end_call before the goodbye is spoken: backend response is continued, goodbye audio is allowed to start and finish, then hangup", async () => {
+  const c = await midConversation();
+  await c.delegation("item_d1");
+  await c.tool("item_d1", "call_ro", "report_outcome", c.outcomeArgs);
+  const pending = c.tool("item_d1", "call_ec", "end_call", { reason: "objective_complete" });
+  await sleep(20);
+  const types = c.sentTypesNow();
+  assert.equal(types.filter((t) => t === "response.item.create").length, 2);
+  assert.equal(types.filter((t) => t === "response.create").length, 2, "end_call output is followed by response.create so the live model gets its goodbye line");
+  assert.equal(c.tw.hangups(), 0, "not hung up before the goodbye");
+  assert.equal(c.sess.closingStage, "goodbye");
+  // goodbye starts inside the start window and runs for a while; hangup must wait for it
+  await sleep(60);
+  await c.agentTurn("You're all set, thanks Maria. Goodbye!", 120, 9000);
+  assert.equal(c.tw.hangups(), 0, "still not hung up while the goodbye audio is flowing");
+  await pending;
+  const out = await c.p.getOutcome("CA900");
+  assert.equal(out.ended, true); assert.equal(out.state, "completed"); assert.equal(c.tw.hangups(), 1);
+  assert.equal(out.raw.close_trigger, "end_call"); assert.equal(out.raw.end_reason, "objective_complete");
+  assert.ok((out.raw.goodbye_done_ms as number) >= 120, `goodbye stage lasted the whole utterance (got ${out.raw.goodbye_done_ms} ms)`);
+  assert.ok(c.media.events().includes("mark"));
+});
+
+test("end_call with no goodbye at all hangs up after the start window (no dead line)", async () => {
+  const c = await midConversation();
+  const t0 = Date.now();
+  await c.tool("item_dx", "call_ec", "end_call", { reason: "wrong_number" });
+  const out = await c.p.getOutcome("CA900");
+  assert.equal(out.ended, true); assert.equal(c.tw.hangups(), 1);
+  const took = Date.now() - t0;
+  assert.ok(took >= FAST_CLOSE.goodbyeStartWaitMs - 5 && took < FAST_CLOSE.goodbyeStartWaitMs + 400, `waited for a goodbye to start, then gave up (${took} ms)`);
+  assert.equal(out.raw.end_reason, "wrong_number");
+});
+
+test("barge-in during the goodbye cancels the close; a farewell or an acknowledgement does not; the next goodbye ends the call", async () => {
+  const c = await midConversation();
+  // First goodbye: callee cuts in with a real question while the audio is still playing.
+  const first = c.agentTurn("Alright, you're all set. Goodbye!", 120, 8000);
+  await sleep(50);
+  assert.equal(c.sess.closingStage, "goodbye");
+  await c.human("Wait, which Tuesday was that?", 8300);
+  assert.equal(c.sess.closingStage, "none", "close cancelled: the person has more to say");
+  await first;
+  await sleep(FAST_CLOSE.goodbyeStartWaitMs + 100);
+  assert.equal(c.tw.hangups(), 0, "no hangup after a cancelled close");
+  assert.equal((await c.p.getOutcome("CA900")).raw.close_cancels, 1);
+  // Conversation recovers; second goodbye with an acknowledgement + farewell from the callee talking over it.
+  await c.agentTurn("Tuesday the 22nd at 10.", 60, 9000);
+  await c.human("Oh right, perfect.", 9800);
+  const second = c.agentTurn("Anything else is easy to change later. Goodbye!", 120, 10500);
+  await sleep(50);
+  assert.equal(c.sess.closingStage, "goodbye");
+  await c.human("Okay, thanks, bye!", 10800);
+  assert.equal(c.sess.closingStage, "goodbye", "a farewell over the goodbye does not cancel");
+  await second;
+  assert.equal(await c.untilEnded(), true);
+  assert.equal(c.tw.hangups(), 1);
+  assert.equal((await c.p.getOutcome("CA900")).raw.close_trigger, "agent_farewell");
+});
+
+test("cancel budget: after maxCancels barge-ins the close is firm", async () => {
+  const c = await midConversation({ maxCancels: 1 });
+  const first = c.agentTurn("Okay then, goodbye!", 120, 8000);
+  await sleep(50);
+  await c.human("Hang on a second", 8200);
+  assert.equal(c.sess.closingStage, "none");
+  await first;
+  await sleep(FAST_CLOSE.goodbyeStartWaitMs + 60);
+  assert.equal(c.tw.hangups(), 0);
+  const second = c.agentTurn("Sure. All set now, goodbye!", 120, 9500);
+  await sleep(50);
+  await c.human("Wait wait one more question", 9700);
+  assert.equal(c.sess.closingStage, "goodbye", "budget spent: this goodbye is final");
+  await second;
+  assert.equal(await c.untilEnded(), true);
+  assert.equal(c.tw.hangups(), 1);
+});
+
+test("a goodbye mentioned inside a question is not a close (early match is abandoned once the sentence finishes)", async () => {
+  const c = await midConversation();
+  await c.agentTurn("Before we say goodbye, which day works best for you?", 80, 8000);
+  await sleep(FAST_CLOSE.goodbyeQuietMs + 80);
+  assert.equal(c.sess.closingStage, "none", "close abandoned: the last sentence is a question");
+  await sleep(FAST_CLOSE.outcomeWaitMs + FAST_CLOSE.playoutWaitMs + 60);
+  assert.equal(c.tw.hangups(), 0);
+  assert.equal((await c.p.getOutcome("CA900")).ended, false);
+  assert.equal(c.sess.inputMuted, false);
+});
+
+test("callee says goodbye and the agent stays silent: hang up after OPENAI_LIVE_FAREWELL_SILENCE_MS instead of a dead line", async () => {
+  const c = await midConversation();
+  const t0 = Date.now();
+  await c.human("Alright, thanks, bye!", 7000);
+  assert.equal(c.tw.hangups(), 0);
+  assert.equal(await c.untilEnded(1200), true);
+  const took = Date.now() - t0;
+  assert.ok(took >= config.openaiLive.farewellSilenceMs - 5, `waited for the agent first (${took} ms)`);
+  const out = await c.p.getOutcome("CA900");
+  assert.equal(out.raw.close_trigger, "human_farewell"); assert.equal(out.raw.end_reason, "callee_said_goodbye"); assert.equal(c.tw.hangups(), 1);
+});
+
+test("callee goodbye answered by the agent's goodbye takes the agent-farewell path once; callee continuing cancels the silence watchdog", async () => {
+  const c = await midConversation();
+  await c.human("Great, thank you, goodbye!", 7000);
+  await sleep(30);
+  await c.agentTurn("Thank you, Maria. Goodbye!", 60, 7600);
+  assert.equal(await c.untilEnded(), true);
+  assert.equal(c.tw.hangups(), 1);
+  assert.equal((await c.p.getOutcome("CA900")).raw.close_trigger, "agent_farewell");
+
+  const d = await midConversation();
+  await d.human("Okay bye", 7000);
+  await sleep(40);
+  await d.human("oh wait, actually, can you also ask about parking?", 7500);
+  await sleep(config.openaiLive.farewellSilenceMs + 150);
+  assert.equal(d.tw.hangups(), 0, "the person kept talking; no silence hangup");
+  assert.equal((await d.p.getOutcome("CA900")).ended, false);
+});
+
+test("Twilio never echoes the mark: hangup still happens after playoutWaitMs", async () => {
+  const c = await midConversation();
+  c.media.echoMarks = false;
+  const t0 = Date.now();
+  await c.agentTurn("All set. Goodbye!", 40, 8000);
+  assert.equal(await c.untilEnded(1500), true);
+  const took = Date.now() - t0;
+  assert.ok(took >= FAST_CLOSE.playoutWaitMs, `waited out the mark (${took} ms)`);
+  assert.equal(c.tw.hangups(), 1);
+});
+
+test("OPENAI_LIVE_FAREWELL_HANGUP=false: goodbyes are ignored, only end_call hangs up", async () => {
+  const saved = config.openaiLive.farewellHangup;
+  try {
+    (config.openaiLive as { farewellHangup: boolean }).farewellHangup = false;
+    const c = await midConversation();
+    await c.agentTurn("You're all set. Goodbye!", 40, 8000);
+    await c.human("Bye!", 8600);
+    await sleep(config.openaiLive.farewellSilenceMs + FAST_CLOSE.playoutWaitMs + 150);
+    assert.equal(c.tw.hangups(), 0);
+    assert.equal(c.sess.closingStage, "none");
+    await c.tool("item_dx", "call_ec", "end_call", { reason: "objective_complete" });
+    assert.equal(c.tw.hangups(), 1);
+  } finally { (config.openaiLive as { farewellHangup: boolean }).farewellHangup = saved; }
+});
+
+test("closing does not disturb needs_user: a hold released by Brian's answer still continues the call; a goodbye afterwards ends it", async () => {
+  const c = await midConversation();
+  const pending = c.tool("item_q", "q1", "ask_owner", { question: "Tue or Wed?", options: ["Tue", "Wed"] });
+  await sleep(5);
+  const st = await c.p.getOutcome("CA900");
+  assert.equal(st.state, "needs_user");
+  assert.equal((await c.p.answerQuestion("CA900", (st.raw.pending_question as { id: string }).id, "Tue")).delivered, true);
+  await pending;
+  assert.equal((await c.p.getOutcome("CA900")).state, "in_progress");
+  await c.agentTurn("Brian says Tuesday. You're all set, goodbye!", 40, 9000);
+  assert.equal(await c.untilEnded(), true);
+  assert.equal((await c.p.getOutcome("CA900")).state, "completed");
+});
+
+test("prompts: live Closing rule + backend one-turn close (report_outcome, end_call, goodbye line) replace the goodbye-first ping-pong", async () => {
+  const { ws } = await answeredCall();
+  const s = JSON.parse(ws.sent[0]).session;
+  const live: string = s.instructions;
+  assert.match(live, /Closing: .*delegate to the backend first .*then say exactly one short goodbye and stop; the call is hung up for you after it\./);
+  assert.match(live, /Never repeat a goodbye, ask "anything else\?", or open a new topic after it\./);
+  assert.match(live, /If the person says goodbye first, reply with one short goodbye\./);
+  assert.match(live, /If they interrupt your goodbye, answer briefly, then close again\./);
+  assert.match(live, /You need to record the final outcome or hang up \(before your goodbye, not after\)/);
+  const backend: string = s.delegation.responses.instructions;
+  assert.match(backend, /in ONE turn call report_outcome .* then call end_call .* then reply with the single short goodbye sentence/);
+  assert.match(backend, /Never tell the assistant to say goodbye and come back to you/);
+  const endCall = s.delegation.responses.tools.find((t: { name: string }) => t.name === "end_call");
+  assert.match(endCall.description, /Call this right after report_outcome, in the same turn/);
+  assert.doesNotMatch(endCall.description, /Only after the assistant has said goodbye/);
 });

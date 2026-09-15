@@ -74,8 +74,11 @@ export const config = {
     farewellHangup: env("OPENAI_LIVE_FAREWELL_HANGUP", "true").toLowerCase() !== "false",
     /** After the callee says goodbye, hang up once the agent has been silent this long (its own goodbye ends the call sooner). */
     farewellSilenceMs: num("OPENAI_LIVE_FAREWELL_SILENCE_MS", 4000),
-    /** Send Twilio `clear` (drop queued agent audio) as soon as the human starts talking. GPT-Live already stops itself; this only trims Twilio's playout buffer. */
-    clearOnBargeIn: env("OPENAI_LIVE_CLEAR_ON_BARGE_IN", "false").toLowerCase() === "true",
+    /**
+     * Send Twilio `clear` (drop the agent audio still queued at Twilio) when the callee interrupts with something
+     * substantive (not "mm-hm"/"okay"). GPT-Live stops generating on its own; this stops the already-buffered tail.
+     */
+    clearOnBargeIn: env("OPENAI_LIVE_CLEAR_ON_BARGE_IN", "true").toLowerCase() !== "false",
     /** session.store=true keeps a 30-day recording at OpenAI (must be enabled on the project). */
     store: env("OPENAI_LIVE_STORE", "false").toLowerCase() === "true",
     /** Twilio ring timeout (s) before no-answer. */
