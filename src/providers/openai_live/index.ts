@@ -190,7 +190,7 @@ export class OpenAiLiveProvider implements PhoneProvider {
           if (call && (msg.media?.track ?? "inbound") === "inbound" && typeof msg.media?.payload === "string") call.session?.appendAudio(msg.media.payload);
           break;
         case "dtmf":
-          if (call) call.turns.push({ speaker: "system", text: `[callee pressed ${String(msg.dtmf?.digit ?? "?")}]`, at: new Date(this.now()).toISOString() });
+          if (call) this.note(call, `[callee pressed ${String(msg.dtmf?.digit ?? "?")}]`);
           break;
         case "stop":
           if (call) this.onStreamStopped(call);
@@ -201,6 +201,13 @@ export class OpenAiLiveProvider implements PhoneProvider {
     });
     ws.on("close", () => { if (call) this.onStreamStopped(call); });
     ws.on("error", (e: Error) => { log.warn("openai_live.media.error", { error: String(e) }); if (call) this.onStreamStopped(call); });
+  }
+
+  /** The session owns the chronologically ordered transcript once it exists; before that, the call record does. */
+  private turnsOf(c: LiveCall): TranscriptTurn[] { return c.session ? c.session.turns : c.turns; }
+  private note(c: LiveCall, text: string) {
+    if (c.session) c.session.noteSystem(text);
+    else c.turns.push({ speaker: "system", text, at: new Date(this.now()).toISOString() });
   }
 
   private onStreamStopped(c: LiveCall) {
@@ -232,7 +239,8 @@ export class OpenAiLiveProvider implements PhoneProvider {
     });
     session.on("audio", (b64: string) => { if (c.stream) c.stream.ws.send(JSON.stringify({ event: "media", streamSid: c.stream.streamSid, media: { payload: b64 } })); });
     session.on("barge_in", () => { if (config.openaiLive.clearOnBargeIn && c.stream) c.stream.ws.send(JSON.stringify({ event: "clear", streamSid: c.stream.streamSid })); });
-    session.on("turn", (t: TranscriptTurn) => { c.turns.push(t); });
+    // Anything noted before the session existed (rare: pre-answer events) is carried over; from here the session's ordered list is the transcript.
+    for (const t of c.turns) session.noteSystem(t.text);
     session.on("outcome", (o: Record<string, unknown>) => { c.outcome = o; });
     session.on("started", (id: string | null) => { c.raw.openai_session_id = id; });
     session.on("greeting_fallback", () => { c.raw.greeting_fallback = true; log.info("openai_live.greeting_fallback", { task_id: c.task_id, note: "callee did not speak after pickup; agent opened" }); });
@@ -321,15 +329,16 @@ export class OpenAiLiveProvider implements PhoneProvider {
     const ended = !!c.ended_at;
     const twilioDuration = typeof c.raw.twilio_duration === "number" ? (c.raw.twilio_duration as number) : null;
     const duration = ended && twilioDuration != null ? twilioDuration : c.answered_at ? Math.round(((c.ended_at ?? this.now()) - c.answered_at) / 1000) : null;
-    const transcript = c.turns.map((t) => `${t.speaker}: ${t.text}`).join("\n");
+    const turns = this.turnsOf(c);
+    const transcript = turns.map((t) => `${t.speaker}: ${t.text}`).join("\n");
     const usage = c.session?.usageSeconds ?? null;
     return {
       call_id, ended, state: c.state,
-      human_answered: ended ? (c.human_answered ?? c.turns.some((t) => t.speaker === "human")) : c.human_answered,
+      human_answered: ended ? (c.human_answered ?? turns.some((t) => t.speaker === "human")) : c.human_answered,
       voicemail: ended ? (c.voicemail ?? false) : c.voicemail,
-      duration_seconds: duration, transcript, transcript_turns: c.turns,
+      duration_seconds: duration, transcript, transcript_turns: turns,
       recording_reference: config.openaiLive.store && c.session?.sessionId ? `openai-live://sessions/${c.session.sessionId}/content` : null,
-      error: c.error ?? (ended && c.turns.length === 0 && !c.voicemail ? "no_transcript" : null),
+      error: c.error ?? (ended && turns.length === 0 && !c.voicemail ? "no_transcript" : null),
       // Voice layer is billed at $0.05/min per OpenAI's launch pricing; backend tokens and Twilio minutes are extra.
       cost_usd: usage != null ? Number(((usage / 60) * 0.05).toFixed(4)) : null,
       provider_extraction: c.outcome ? (c.outcome as ProviderCallOutcome["provider_extraction"]) : null,

@@ -1,9 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { createHmac } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AddressInfo } from "node:net";
+import WebSocket from "ws";
+import { createHttpServer } from "../src/server/http.js";
 import { OpenAiLiveProvider, dialForm, mediaStreamTwiml, type MediaWsLike } from "../src/providers/openai_live/index.js";
 import { OpenAiLiveSession, LIVE_TOOL_NAMES } from "../src/providers/openai_live/live.js";
 import { TwilioClient, type TwilioHttp } from "../src/providers/xai/twilio.js";
@@ -375,6 +379,61 @@ test("session config honors env-backed backend tuning and per-call voice", async
     assert.equal(s.delegation.responses.service_tier, "priority");
     assert.equal(s.store, true);
   } finally { Object.assign(config.openaiLive, saved); }
+});
+
+test("HTTP layer: signed Twilio callbacks route to openai_live; Media Streams WebSocket upgrades on /webhooks/openai-live/media only", async () => {
+  const { p, ws } = makeProvider();
+  await p.startCall(input());
+  const store = new CallStore(mkdtempSync(join(tmpdir(), "phone-live-http-")));
+  const service = new PhoneService({ providers: { openai_live: p }, defaultProvider: "openai_live", store, useLlmExtraction: false });
+  const server = createHttpServer(service, { openaiLive: p });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const port = (server.address() as AddressInfo).port;
+  const base = `http://127.0.0.1:${port}`;
+  const signed = (path: string, form: Record<string, string>) => {
+    const data = `${config.publicBaseUrl}${path}` + Object.keys(form).sort().map((k) => k + form[k]).join("");
+    return createHmac("sha1", config.twilio.authToken).update(data).digest("base64");
+  };
+  try {
+    const health = await (await fetch(`${base}/healthz`)).json() as { providers: string[] };
+    assert.deepEqual(health.providers, ["openai_live"]);
+
+    const form = { CallSid: "CA900", CallStatus: "ringing" };
+    const bad = await fetch(`${base}/webhooks/openai-live/twilio/status`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "x-twilio-signature": "nope" }, body: new URLSearchParams(form).toString() });
+    assert.equal(bad.status, 401);
+    const ok = await fetch(`${base}/webhooks/openai-live/twilio/status`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "x-twilio-signature": signed("/webhooks/openai-live/twilio/status", form) }, body: new URLSearchParams(form).toString() });
+    assert.equal(ok.status, 200);
+    assert.equal((await p.getOutcome("CA900")).state, "ringing");
+    const amd = { CallSid: "CA900", AnsweredBy: "human" };
+    await fetch(`${base}/webhooks/openai-live/twilio/amd`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "x-twilio-signature": signed("/webhooks/openai-live/twilio/amd", amd) }, body: new URLSearchParams(amd).toString() });
+    assert.equal((await p.getOutcome("CA900")).raw.answered_by, "human");
+    // xai-only webhooks report not configured rather than crashing
+    assert.equal((await fetch(`${base}/webhooks/xai`, { method: "POST", body: "{}" })).status, 503);
+
+    // wrong WS path is refused
+    await assert.rejects(new Promise((_, reject) => { const w = new WebSocket(`ws://127.0.0.1:${port}/nope`); w.on("error", reject); w.on("open", () => reject(new Error("should not open"))); }));
+
+    // real Twilio-style stream
+    const client = new WebSocket(`ws://127.0.0.1:${port}/webhooks/openai-live/media`);
+    await new Promise<void>((r, j) => { client.on("open", () => r()); client.on("error", j); });
+    client.send(JSON.stringify({ event: "connected", protocol: "Call" }));
+    client.send(JSON.stringify({ event: "start", start: { streamSid: "MZ9", callSid: "CA900", customParameters: { task_id: "task_l1" } } }));
+    await sleep(30);
+    assert.equal((await p.getOutcome("CA900")).state, "in_progress");
+    assert.equal((await p.getOutcome("CA900")).raw.stream_sid, "MZ9");
+    ws.emit("open");
+    await session(p).handle(JSON.stringify({ type: "session.started", session: { id: "live_http" } }));
+    const gotMedia = new Promise<Record<string, unknown>>((r) => client.on("message", (d) => r(JSON.parse(String(d)))));
+    client.send(JSON.stringify({ event: "media", media: { track: "inbound", payload: "ZZZZ" } }));
+    await session(p).handle(JSON.stringify({ type: "session.output_audio.delta", delta: "YYYY" }));
+    assert.deepEqual(await gotMedia, { event: "media", streamSid: "MZ9", media: { payload: "YYYY" } });
+    await sleep(10);
+    assert.ok(ws.sent.some((m) => m === JSON.stringify({ type: "session.input_audio.append", audio: "ZZZZ" })), "inbound audio reached the GPT-Live socket");
+    client.close();
+  } finally {
+    service.shutdown();
+    await new Promise<void>((r) => server.close(() => r()));
+  }
 });
 
 test("openai_live through PhoneService with per-call provider override; bland remains default", async () => {

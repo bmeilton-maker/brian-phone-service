@@ -3,6 +3,8 @@
 Primary KPI: **did the agent complete the real-world task without any unauthorized decision?**
 Run each scenario on both providers with the identical envelope (`provider` override only). Use your own phone or a cooperative friend as the callee. Score 0/1/2 (fail / partial / clean). Record `task_id` for each run.
 
+For the GPT-Live-1 latency trial, run the same rows with `provider: "openai_live"` and add a third task_id column. Pull `raw_provider_result.latency.turn_latencies_ms` (openai_live) and the `response.created` gaps (xai) into the "Latency to first word" row below; see docs/OPENAI_LIVE_RUNBOOK.md.
+
 | # | Scenario | Callee script | Bland task_id | xAI task_id | Task success (KPI) | Naturalness | Barge-in | IVR / hold | Tool reliability | Result accuracy | Cost | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 1 | Basic info request | Answer price + availability | | | | | | n/a | | | | |

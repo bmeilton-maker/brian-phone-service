@@ -3,6 +3,7 @@
  *   npm run demo                  -> mock provider, scheduling scenario, full envelope -> result flow
  *   npm run demo -- needs_user    -> any scenario name from src/providers/mock.ts
  *   npm run demo -- xai-session   -> drives XaiRealtimeSession with a fake socket: envelope -> session.update -> tool calls -> structured outcome
+ *   npm run demo -- openai-live-session -> drives OpenAiLiveSession (GPT-Live-1) with a fake socket: session.start -> transcript -> delegated tools -> outcome
  */
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,7 +13,9 @@ import { PhoneService } from "../service.js";
 import { CallStore } from "../store.js";
 import { buildEnvelope, buildAgentInstructions } from "../envelope.js";
 import { XaiRealtimeSession, TOOL_NAMES } from "../providers/xai/realtime.js";
+import { OpenAiLiveSession, LIVE_TOOL_NAMES, backendInstructionsAddendum, liveConversationAddendum } from "../providers/openai_live/live.js";
 import { FakeWs } from "../providers/xai/fakews.js";
+import { config } from "../config.js";
 import type { MakeCallRequest } from "../types.js";
 
 const arg = process.argv[2] ?? "scheduling";
@@ -46,8 +49,42 @@ if (arg === "xai-session") {
   process.exit(0);
 }
 
+if (arg === "openai-live-session") {
+  (config.openaiLive as { apiKey: string }).apiKey ||= "demo-key";
+  const env = buildEnvelope(req);
+  const base = { recipient_name: req.recipient_name, realtime_hold_supported: true, hold_seconds: 45 };
+  const ws = new FakeWs();
+  const session = new OpenAiLiveSession({
+    instructions: buildAgentInstructions(env, base) + "\n" + liveConversationAddendum("Brian"),
+    backendInstructions: buildAgentInstructions(env, { ...base, tools: [...LIVE_TOOL_NAMES] }) + "\n" + backendInstructionsAddendum("Brian"),
+    ownerName: "Brian", voice: "marin", wsFactory: () => ws, greetingWaitMs: 50,
+    hooks: { onAskOwner: async (q) => { console.log(`\n[needs Brian] ${q}\n[auto-answer for demo] Tuesday`); return "Tuesday"; }, onEndCall: async (r) => console.log(`[hangup] reason=${r}`) },
+  });
+  session.on("turn", (t) => console.log(`${t.speaker}: ${t.text}`));
+  session.on("greeting_fallback", () => console.log("[greeting fallback: callee silent, agent opens]"));
+  session.connect();
+  ws.emit("open");
+  const start = JSON.parse(ws.sent[0]);
+  console.log("--- client -> OpenAI:", start.type, JSON.stringify({ model: start.session.model, audio: start.session.audio, delegation: { type: start.session.delegation.type, backend: start.session.delegation.responses.model, tools: start.session.delegation.responses.tools.map((t: { name: string }) => t.name) } }));
+  console.log("--- session.instructions preview:\n" + start.session.instructions.slice(0, 600) + "\n...");
+  await session.handle(JSON.stringify({ type: "session.started", session: { id: "live_demo" } }));
+  await session.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "Riverside Dental, this is Maria.", start_ms: 900, end_ms: 2100 }));
+  await session.handle(JSON.stringify({ type: "session.output_transcript.delta", delta: "Hi, this is Brian's AI assistant. I'd like to schedule a dental cleaning for Brian.", start_ms: 2600, end_ms: 5200 }));
+  await session.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "We have Tuesday 10 AM or Wednesday 2 PM.", start_ms: 6000, end_ms: 8500 }));
+  await session.handle(JSON.stringify({ type: "session.delegation.created", delegation: { id: "item_d1", type: "delegation", target: "responses" }, response_id: "resp_1" }));
+  await session.handle(JSON.stringify({ type: "response.event", delegation_id: "item_d1", event: { type: "response.output_item.done", item: { type: "function_call", status: "completed", call_id: "c1", name: "ask_owner", arguments: JSON.stringify({ question: "Tuesday 10 AM or Wednesday 2 PM?", options: ["Tuesday 10 AM", "Wednesday 2 PM"] }) } } }));
+  await session.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "Booked Tuesday 10 AM, confirmation DC-48213.", start_ms: 15000, end_ms: 18000 }));
+  await session.handle(JSON.stringify({ type: "session.delegation.created", delegation: { id: "item_d2", type: "delegation", target: "responses" }, response_id: "resp_2" }));
+  await session.handle(JSON.stringify({ type: "response.event", delegation_id: "item_d2", event: { type: "response.output_item.done", item: { type: "function_call", status: "completed", call_id: "c2", name: "report_outcome", arguments: JSON.stringify({ status: "success", summary: "Booked Tuesday 10 AM, confirmation DC-48213.", human_or_business_reached: "Riverside Dental receptionist", results: { "appointment date": "Tuesday", "appointment time": "10:00 AM", "confirmation number": "DC-48213" }, commitments_made: ["Cleaning Tuesday 10 AM"], financial_commitments: [], dates_and_times: ["Tuesday 10:00 AM"], confirmation_numbers: ["DC-48213"], follow_up_required: false, follow_up: null, questions_for_brian: [] }) } } }));
+  await session.handle(JSON.stringify({ type: "response.event", delegation_id: "item_d2", event: { type: "response.output_item.done", item: { type: "function_call", status: "completed", call_id: "c3", name: "end_call", arguments: JSON.stringify({ reason: "objective_complete" }) } } }));
+  await session.handle(JSON.stringify({ type: "session.closed", reason: "close_requested", usage: { seconds: 61 } }));
+  console.log("--- client messages:", ws.sent.map((m) => JSON.parse(m).type).join(", "));
+  console.log("--- structured outcome from report_outcome:\n" + JSON.stringify(session.outcome, null, 2));
+  process.exit(0);
+}
+
 const scenario = arg as ScenarioName;
-if (!SCENARIOS[scenario]) { console.error(`unknown scenario "${arg}". options: ${Object.keys(SCENARIOS).join(", ")}, xai-session`); process.exit(1); }
+if (!SCENARIOS[scenario]) { console.error(`unknown scenario "${arg}". options: ${Object.keys(SCENARIOS).join(", ")}, xai-session, openai-live-session`); process.exit(1); }
 const store = new CallStore(mkdtempSync(join(tmpdir(), "phone-demo-")));
 const svc = new PhoneService({ providers: { mock: new MockProvider({ scenario, ticks: 1 }) }, defaultProvider: "mock", store, useLlmExtraction: false, pollIntervalMs: 50 });
 const started = await svc.makeCall({ ...req, provider: "mock" });

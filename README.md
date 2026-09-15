@@ -5,13 +5,14 @@ Grok hands the service a small, task-scoped **call envelope**; the service place
 provider, runs the conversation, and returns one **normalized structured result**.
 
 ```
-Grok Chief of Staff -> phone MCP tools -> PhoneService -> { BlandProvider | XaiProvider | MockProvider } -> PSTN -> human
+Grok Chief of Staff -> phone MCP tools -> PhoneService -> { BlandProvider | XaiProvider | OpenAiLiveProvider | MockProvider } -> PSTN -> human
                                                      <- normalized result (summary + structured fields + transcript)
 ```
 
-* **Default provider: `bland`** (proven, unchanged behavior). Switch with `PHONE_PROVIDER=xai` or per call with `provider: "xai"`.
+* **Default provider: `bland`** (proven, unchanged behavior). Switch with `PHONE_PROVIDER=xai|openai_live` or per call with `provider: "xai"` / `"openai_live"`.
 * **Bland is never removed.** It is the fallback behind the same interface.
 * **xAI provider**: Twilio dials the PSTN leg, bridges into xAI Direct SIP, and a Grok Voice realtime session runs the call with the envelope as `session.instructions` and in-call tools (`report_outcome`, `ask_owner`, `end_call`, `send_dtmf`, `note_hold`).
+* **OpenAI GPT-Live-1 provider (`openai_live`, latency trial)**: Twilio dials the callee and opens a Media Stream to this service, which relays mu-law audio to OpenAI's Live Sessions WebSocket (`gpt-live-1`). Same envelope prompt, same greeting hold, tools via Responses delegation (`report_outcome`, `ask_owner`, `end_call`, `note_hold`). Runbook: **docs/OPENAI_LIVE_RUNBOOK.md**.
 * **Mock provider**: scripted scenarios; runs the whole pipeline with no keys and no network. Used by tests, CI, and `npm run demo`.
 * **Secrets are env-only.** Never in prompts, transcripts, logs, or stored records (the store and logger redact anything key-like).
 * **Identity**: the agent always says it is Brian's AI assistant. It never claims to be Brian, never uses a cloned voice. xAI default voice is `eve`.
@@ -21,10 +22,11 @@ Grok Chief of Staff -> phone MCP tools -> PhoneService -> { BlandProvider | XaiP
 ```bash
 cp .env.example .env         # fill in BLAND_API_KEY at minimum
 npm install
-npm test                     # mocked regression suite (31 tests)
+npm test                     # mocked regression suite (48 tests)
 npm run demo                 # mock scheduling call, envelope -> result
 npm run demo -- needs_user   # human-in-the-loop flow
 npm run demo -- xai-session  # envelope -> xAI session.update -> tool calls -> structured outcome, no network
+npm run demo -- openai-live-session  # envelope -> GPT-Live session.start -> delegated tools -> outcome, no network
 npm run start:mcp            # MCP server on stdio (what Grok/Ring connects to)
 npm run start:http           # HTTP API + webhooks on :8787
 ```
@@ -42,7 +44,7 @@ Tools (provider-independent):
 | `phone_get_status` | `{state, started_at, duration_seconds, human_answered, voicemail, intervention_required, pending_question}` |
 | `phone_get_result` | Normalized result once finished; `{pending:true,status}` while active. |
 | `phone_cancel_call` | Hang up an active or queued call. |
-| `phone_answer_question` | Deliver Brian's answer while the agent holds the line (`needs_user`; xai and mock). |
+| `phone_answer_question` | Deliver Brian's answer while the agent holds the line (`needs_user`; xai, openai_live and mock). |
 
 Recommended Grok loop: `phone_make_call` -> poll `phone_get_status` every 15 to 30 s -> if `state == needs_user`, surface `pending_question` to Brian and call `phone_answer_question` -> on `completed|failed|cancelled` call `phone_get_result` and show `summary` (keep `transcript` and `raw_provider_result` for troubleshooting only).
 
@@ -76,7 +78,7 @@ Extraction order: provider structured outcome (xAI `report_outcome` tool call) >
 
 | Var | Default | Notes |
 |---|---|---|
-| `PHONE_PROVIDER` | `bland` | `bland` / `xai` / `mock`. Per-call `provider` overrides. |
+| `PHONE_PROVIDER` | `bland` | `bland` / `xai` / `openai_live` / `mock`. Per-call `provider` overrides. |
 | `BLAND_API_KEY` | | Required for Bland. |
 | `BLAND_VOICE`, `BLAND_MODEL`, `BLAND_BACKGROUND_TRACK`, `BLAND_TEMPERATURE`, `BLAND_FROM_NUMBER` | `maya`, `base`, `office`, `0.5`, blank | Existing adapter settings. |
 | `XAI_API_KEY` | | Required for xai provider and for LLM extraction. |
@@ -84,16 +86,20 @@ Extraction order: provider structured outcome (xAI `report_outcome` tool call) >
 | `XAI_REALTIME_MODEL` | `grok-voice-latest` | Realtime model alias. |
 | `XAI_EXTRACTION_MODEL` | `grok-4-fast` | Text model for transcript -> result. |
 | `XAI_SIP_NUMBER`, `XAI_WEBHOOK_SECRET` | | From registering a Direct SIP number (see docs/PROVISIONING.md). |
-| `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` | | Dials for xai (SIP leg first, then the human). |
+| `OPENAI_API_KEY` | | Required for the openai_live provider. |
+| `OPENAI_LIVE_MODEL`, `OPENAI_LIVE_VOICE` | `gpt-live-1`, `marin` | Live voice model and voice. |
+| `OPENAI_LIVE_BACKEND_MODEL` | `gpt-5.6-terra` | Responses-delegation backend that runs the tools (`gpt-5.6-luna` is cheaper). Optional `OPENAI_LIVE_BACKEND_REASONING_EFFORT`, `OPENAI_LIVE_BACKEND_SERVICE_TIER`. |
+| `OPENAI_LIVE_GREETING_WAIT_MS`, `OPENAI_LIVE_HANGUP_DELAY_MS`, `OPENAI_LIVE_CLEAR_ON_BARGE_IN`, `OPENAI_LIVE_STORE` | `3000`, `2500`, `false`, `false` | Greeting hold, goodbye drain before hangup, Twilio buffer clear on barge-in, keep a recording at OpenAI. |
+| `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` | | Dials for xai (SIP leg first, then the human) and openai_live (callee + Media Stream). |
 | `TWILIO_VALIDATE_SIGNATURE` | `true` | Verify `X-Twilio-Signature` on webhooks. Rejections are logged as `twilio.webhook.rejected` with the expected URL. |
 | `TWILIO_RECONCILE_AFTER_MS` | `45000` | If no Twilio callback arrives for this long, `get_status` asks Twilio directly. |
-| `PUBLIC_BASE_URL` | | Public HTTPS URL of this service; needed for xAI and Twilio webhooks. |
+| `PUBLIC_BASE_URL` | | Public HTTPS URL of this service; needed for xAI and Twilio webhooks and the openai_live media WebSocket. |
 | `PHONE_SERVICE_TOKEN` | | Bearer token for the HTTP API. |
 | `DATA_DIR` | `./data` | Call records (`data/calls/<task_id>.json`). |
 | `DEFAULT_MAX_DURATION_SECONDS` | `600` | |
 | `NEEDS_USER_HOLD_SECONDS` | `45` | How long the xAI agent waits for Brian's answer. |
 
-The xai provider is registered only when every xAI/Twilio variable is present; otherwise the service logs `xai.not_configured` and keeps running on Bland.
+The xai provider is registered only when every xAI/Twilio variable is present; otherwise the service logs `xai.not_configured` and keeps running on Bland. Likewise `openai_live` needs `OPENAI_API_KEY` + Twilio + `PUBLIC_BASE_URL` or it logs `openai_live.not_configured`.
 
 ## Current Bland behavior (preserved as `BlandProvider`)
 
@@ -119,6 +125,18 @@ Outbound path (xAI SIP is inbound-first; there is no documented "dial this PSTN 
 3. TwiML on the answered SIP leg runs `<Dial><Number statusCallback=… machineDetection="Enable">{callee}</Number></Dial>` (child leg). The callee is dialed from a live line and is bridged to the agent the moment they pick up.
 4. Child-leg `in-progress` callback releases `response.create`; the agent greets. Transcripts stream in; tool calls are dispatched (`report_outcome` becomes the structured base of the result; `end_call` hangs up via Twilio and finalizes locally; `ask_owner` holds for Brian).
 5. Child-leg `completed` (with Twilio's `CallDuration`), the parent `completed`, a closed socket, or a quiet-callback reconcile against Twilio finalizes; `PhoneService` runs extraction and persists. `duration_seconds` is talk time only (human answered to ended).
+
+## OpenAI GPT-Live-1 provider (`openai_live`)
+
+`src/providers/openai_live/`. Runbook with the chosen path, what is verified, and what to confirm on the first live call: **docs/OPENAI_LIVE_RUNBOOK.md**.
+
+1. `POST /Calls.json` `To={callee}` with inline TwiML `<Connect><Stream url="wss://PUBLIC/webhooks/openai-live/media"><Parameter name="task_id"/></Stream></Connect>`, async AMD, status callbacks on `/webhooks/openai-live/twilio/*`. One leg; our call_id = Twilio CallSid.
+2. Callee answers -> Twilio opens the Media Stream to us -> we open `wss://api.openai.com/v1/live/sessions`, send `session.start` (envelope as instructions + GPT-Live conversation/delegation policy, `audio/pcmu` 8 kHz, Responses delegation with our tools) and relay mu-law both ways unchanged.
+3. Greeting hold: GPT-Live waits for the human natively; if nobody speaks for `OPENAI_LIVE_GREETING_WAIT_MS` we prompt it to open (`session.instructions.append` + `session.commentary.append`). Turn-taking and interruptions are handled by the full-duplex model (no VAD knobs).
+4. Tools arrive as `response.event -> response.output_item.done (function_call)`; we answer with `response.item.create` + `response.create`. `end_call` lets the goodbye drain, hangs up via Twilio and finalizes locally. `ask_owner` holds for Brian (`needs_user`).
+5. Twilio `completed`, stream stop, `session.closed`, or a quiet-callback reconcile finalizes. `raw_provider_result.latency` records setup, first-audio, per-turn and delegation latencies for the A/B against xAI.
+
+Trial: `"provider": "openai_live"` per call (`examples/make_call_openai_live_override.json`), or `PHONE_PROVIDER=openai_live` process-wide. xAI and Bland stay available.
 
 ## Migration plan (Bland -> xAI)
 
@@ -151,7 +169,7 @@ Every call is persisted as `data/calls/<task_id>.json` with `request`, `envelope
 
 ## Testing
 
-* `npm test`: 31 mocked tests covering the 10 brief scenarios, error cases, idempotency, persistence, Bland API shape, xAI webhook signing, xAI session/tool flow, needs_user hold and timeout, cancel, provider override.
+* `npm test`: 48 mocked tests covering the 10 brief scenarios, error cases, idempotency, persistence, Bland API shape, xAI webhook signing, xAI session/tool flow, GPT-Live session/media relay/delegated tools/greeting hold, needs_user hold and timeout, cancel, provider override, HTTP webhook + WebSocket routing.
 * `npm run demo -- <scenario>`: any mock scenario end to end.
 * Live PSTN tests are manual: **docs/SIDE_BY_SIDE_CHECKLIST.md**.
 
@@ -169,10 +187,11 @@ src/service.ts          PhoneService (idempotency, polling, needs_user, persiste
 src/store.ts            file-backed call history with redaction
 src/providers/bland.ts  BlandProvider (unchanged API shape)
 src/providers/xai/      Twilio dial, webhook verify, realtime session, provider
+src/providers/openai_live/  GPT-Live session (WS protocol, tools, greeting hold, latency), Media Streams bridge provider
 src/providers/mock.ts   scripted scenarios
-src/server/http.ts      HTTP API + webhooks
+src/server/http.ts      HTTP API + webhooks + Media Streams WebSocket
 src/server/mcp.ts       MCP stdio server
 src/cli/demo.ts         dry-run demos
-docs/                   provisioning, xAI runbook, side-by-side checklist
+docs/                   provisioning, xAI runbook, OpenAI Live runbook, side-by-side checklist
 examples/               envelope, make_call payloads, result
 ```

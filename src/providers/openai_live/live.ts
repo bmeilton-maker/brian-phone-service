@@ -192,6 +192,9 @@ export class OpenAiLiveSession extends EventEmitter {
     this.send({ type: "session.input_audio.append", audio: b64 });
   }
 
+  /** Record an application-side event (e.g. callee key press) in the transcript in chronological order. */
+  noteSystem(text: string): void { this.pushTurn({ speaker: "system", text }); }
+
   /** Session-wide instruction mid-call (e.g. voicemail detected). No-op before session.started. */
   appendInstructions(eventId: string, content: string): void {
     if (!this.started || this.closed || this.closeRequested) return;
@@ -373,6 +376,8 @@ export class OpenAiLiveSession extends EventEmitter {
     this.handledCalls.add(callId);
     let args: Record<string, unknown> = {};
     try { args = typeof rawArgs === "string" ? JSON.parse(rawArgs || "{}") : (rawArgs as Record<string, unknown>) ?? {}; } catch { /* keep {} */ }
+    // A delegated tool call means the preceding utterances are complete enough to close their turns.
+    this.flushAll();
     log.info("openai_live.tool_call", { session_id: this.sessionId, tool: name, args });
     this.emit("tool", name, args);
     let output: unknown;
