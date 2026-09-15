@@ -768,6 +768,33 @@ test("callee goodbye answered by the agent's goodbye takes the agent-farewell pa
   assert.equal((await d.p.getOutcome("CA900")).ended, false);
 });
 
+test("voicemail greeting ending in 'have a great day' does not trip the callee-goodbye watchdog; the agent's own sign-off after the message does", async () => {
+  // Fresh pickup: the agent has not spoken yet when the recording signs off.
+  const ctx = await answeredCall({ realClock: true, closeTiming: FAST_CLOSE });
+  ctx.media.echoMarks = true;
+  const sess = session(ctx.p);
+  await sess.handle(JSON.stringify({ type: "session.started", session: { id: "live_vm" } }));
+  await sess.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "Hi, you've reached Maria. Leave a message and have a great day!", start_ms: 500, end_ms: 4000 }));
+  ctx.p.handleTwilioAmd({ CallSid: "CA900", AnsweredBy: "machine_end_beep" });
+  await sleep(config.openaiLive.farewellSilenceMs + 150);
+  assert.equal(ctx.tw.hangups(), 0, "no hangup: nobody has been spoken to yet");
+  assert.equal((await ctx.p.getOutcome("CA900")).ended, false);
+  // Agent leaves the message and signs off -> agent_farewell close, hangup.
+  for (let i = 0; i < 4; i++) { await sess.handle(JSON.stringify({ type: "session.output_audio.delta", delta: "QUJD" })); await sleep(10); }
+  await sess.handle(JSON.stringify({ type: "session.output_transcript.delta", delta: "Hi Maria, this is Brian's AI assistant calling about a cleaning. Please call us back. Goodbye!", start_ms: 6000, end_ms: 12000 }));
+  const t0 = Date.now();
+  while (Date.now() - t0 < 1500 && !(await ctx.p.getOutcome("CA900")).ended) await sleep(10);
+  const out = await ctx.p.getOutcome("CA900");
+  assert.equal(out.ended, true); assert.equal(out.voicemail, true); assert.equal(out.raw.close_trigger, "agent_farewell"); assert.equal(ctx.tw.hangups(), 1);
+
+  // Even after the agent has spoken, a machine's sign-off never triggers the silence hangup.
+  const d = await midConversation();
+  d.p.handleTwilioAmd({ CallSid: "CA900", AnsweredBy: "machine_start" });
+  await d.human("Please leave a message after the tone. Goodbye.", 7000);
+  await sleep(config.openaiLive.farewellSilenceMs + FAST_CLOSE.playoutWaitMs + 150);
+  assert.equal(d.tw.hangups(), 0);
+});
+
 test("Twilio never echoes the mark: hangup still happens after playoutWaitMs", async () => {
   const c = await midConversation();
   c.media.echoMarks = false;

@@ -422,6 +422,9 @@ export class OpenAiLiveSession extends EventEmitter {
     if (kind === "substantive" && !this.bargeInSent && t - this.lastAgentAudioAt < AGENT_SILENCE_GAP_MS) { this.bargeInSent = true; this.emit("barge_in"); }
     if (this.opts.farewellDetection === false) return;
     if (kind === "farewell") {
+      // Before the agent has said anything, a "goodbye" from the line is a voicemail greeting or an IVR, not a person
+      // leaving the conversation; the AMD / hangup callbacks own those cases.
+      if (this.lastAgentAudioAt === 0) return;
       if (!this.humanFarewellAt) log.info("openai_live.farewell", { session_id: this.sessionId, speaker: "human", text: runningText.slice(-120) });
       this.humanFarewellAt = t;
       this.emit("farewell", "human", runningText);

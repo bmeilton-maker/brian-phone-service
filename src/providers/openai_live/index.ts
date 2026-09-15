@@ -283,7 +283,8 @@ export class OpenAiLiveProvider implements PhoneProvider {
     // Farewell intent -> hangup sequence. The agent's goodbye starts it directly; a callee goodbye only starts it once
     // the agent has stayed silent (its own goodbye, if it comes first, is the normal path).
     session.on("farewell", (speaker: "assistant" | "human") => { if (speaker === "assistant") void this.closeCall(c, "agent_farewell", "agent_said_goodbye"); });
-    session.on("farewell_silence", () => { void this.closeCall(c, "human_farewell", "callee_said_goodbye"); });
+    // On voicemail the "callee" is a recording; its sign-off must not cut the message the agent is about to leave.
+    session.on("farewell_silence", () => { if (!c.voicemail) void this.closeCall(c, "human_farewell", "callee_said_goodbye"); });
     session.on("human_utterance", (_text: string, kind: string) => { if (kind === "substantive") this.cancelCloseOnBargeIn(c); });
     // Anything noted before the session existed (rare: pre-answer events) is carried over; from here the session's ordered list is the transcript.
     for (const t of c.turns) session.noteSystem(t.text);

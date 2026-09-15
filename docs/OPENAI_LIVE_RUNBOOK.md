@@ -116,7 +116,7 @@ The bridge now owns the close (`OpenAiLiveProvider.closeCall`, `src/providers/op
 |---|---|---|
 | Backend calls `end_call` | `end_call` | `end_call` output is answered with `response.create` so the backend can hand the live model its goodbye line (unless the goodbye already played). |
 | The agent's last sentence is a goodbye and not a question (`isClosingLine`) | `agent_farewell` | Detected on the running output transcript; re-checked once the audio stops ("before we say goodbye, which day?" is abandoned, `openai_live.close_abandoned`). |
-| The callee says goodbye and the agent stays silent for `OPENAI_LIVE_FAREWELL_SILENCE_MS` | `human_farewell` | Callee "bye" alone does nothing while the agent answers; this only catches a dead line. |
+| The callee says goodbye and the agent stays silent for `OPENAI_LIVE_FAREWELL_SILENCE_MS` | `human_farewell` | Callee "bye" alone does nothing while the agent answers; this only catches a dead line. Ignored before the agent has spoken at all (a voicemail greeting's "have a great day") and whenever AMD reported a machine. |
 
 Sequence (`openai_live.closing` -> `openai_live.call_ended`):
 
