@@ -39,7 +39,11 @@ interface LiveCall {
   state: CallState;
   started_at: number;
   answered_at: number | null;
+  /** When we asked Twilio to drop the callee leg (the phone call is over from here). */
+  hangup_at: number | null;
+  /** Set once the call record is final. Between hangup_at and ended_at the OpenAI session may linger to collect a late report_outcome. */
   ended_at: number | null;
+  collecting: boolean;
   last_status_at: number;
   reconciling: boolean;
   human_answered: boolean | null;
@@ -67,7 +71,11 @@ export interface MediaWsLike {
 /** What started the hangup sequence. */
 export type CloseTrigger = "end_call" | "agent_farewell" | "human_farewell";
 
-/** Timing of the hangup sequence. Defaults come from config; tests shrink them. */
+/**
+ * Timing of the hangup sequence. Defaults come from config; tests shrink them. Only the first three and playoutWaitMs
+ * are on the callee's clock (the tail they hear after the goodbye is ~goodbyeQuietMs + mark echo + Twilio API call);
+ * the outcome windows run AFTER the Twilio leg is down.
+ */
 export interface CloseTiming {
   /** After the trigger, wait at most this long for the goodbye audio to begin (0 = hang up immediately, no drain). */
   goodbyeStartWaitMs: number;
@@ -75,18 +83,18 @@ export interface CloseTiming {
   goodbyeQuietMs: number;
   /** Hard cap on the goodbye itself. */
   goodbyeMaxMs: number;
-  /** With no report_outcome recorded yet, wait this long after the goodbye for one to arrive ... */
+  /** Wait for Twilio's `mark` echo (audio fully played) at most this long; 0 disables the mark. */
+  playoutWaitMs: number;
+  /** After hangup, with no report_outcome recorded yet, keep the OpenAI session open this long for one to arrive ... */
   outcomeWaitMs: number;
   /** ... or this long when a backend delegation is already in flight. */
   delegationWaitMs: number;
-  /** Wait for Twilio's `mark` echo (audio fully played) at most this long; 0 disables the mark. */
-  playoutWaitMs: number;
   /** How many times a callee barge-in may cancel the close before it becomes firm. */
   maxCancels: number;
 }
 
 export function defaultCloseTiming(): CloseTiming {
-  return { goodbyeStartWaitMs: config.openaiLive.hangupDelayMs, goodbyeQuietMs: 700, goodbyeMaxMs: 10_000, outcomeWaitMs: 2000, delegationWaitMs: 5000, playoutWaitMs: 3000, maxCancels: 2 };
+  return { goodbyeStartWaitMs: config.openaiLive.hangupDelayMs, goodbyeQuietMs: 500, goodbyeMaxMs: 8000, playoutWaitMs: 1500, outcomeWaitMs: 1500, delegationWaitMs: 5000, maxCancels: 2 };
 }
 
 export interface OpenAiLiveProviderDeps {
@@ -154,7 +162,7 @@ export class OpenAiLiveProvider implements PhoneProvider {
     const { sid, raw } = await this.twilio.createCall(form);
     log.info("twilio.dialed", { task_id: input.task_id, call_sid: sid, path: "media_streams", callee: input.phone_number });
     this.calls.set(sid, {
-      task_id: input.task_id, twilio_sid: sid, input, state: "dialing", started_at: this.now(), answered_at: null, ended_at: null, last_status_at: this.now(), reconciling: false,
+      task_id: input.task_id, twilio_sid: sid, input, state: "dialing", started_at: this.now(), answered_at: null, hangup_at: null, ended_at: null, collecting: false, last_status_at: this.now(), reconciling: false,
       human_answered: null, voicemail: null, error: null, session: null, stream: null, turns: [], outcome: null, pendingQuestion: null,
       closing: null, closeCancels: 0, marks: new Map(),
       raw: { provider: "openai_live", twilio: raw, model: config.openaiLive.model, backend_model: config.openaiLive.backendModel },
@@ -172,6 +180,8 @@ export class OpenAiLiveProvider implements PhoneProvider {
     log.info("twilio.status", { task_id: c.task_id, provider: "openai_live", sid, status: s, duration: form.CallDuration });
     if (s === "completed" && form.CallDuration) c.raw.twilio_duration = Number(form.CallDuration);
     if (c.ended_at) return;
+    // We hung up and are collecting a late report_outcome; the record is finalized when that window closes.
+    if (c.collecting) return;
     if (s === "ringing") { if (c.state === "dialing") c.state = "ringing"; }
     else if (s === "in-progress" || s === "answered") this.markAnswered(c);
     else if (s === "busy") this.end(c, "failed", "busy");
@@ -259,6 +269,7 @@ export class OpenAiLiveProvider implements PhoneProvider {
     if (!c.stream) return;
     log.info("openai_live.media.stopped", { task_id: c.task_id });
     c.stream = null;
+    if (c.collecting) return; // expected after our own hangup; the session stays up for the outcome window
     c.session?.close();
     if (!c.ended_at) void this.reconcile(c);
   }
@@ -295,7 +306,7 @@ export class OpenAiLiveProvider implements PhoneProvider {
     session.on("stale_result", (tool: string) => { c.raw.stale_results = [...((c.raw.stale_results as string[] | undefined) ?? []), tool]; });
     session.on("closed", (info: { session_reason: string | null }) => {
       c.raw.live_close_reason = info.session_reason;
-      if (c.ended_at) return;
+      if (c.ended_at || c.collecting) return; // collecting: the close sequence finalizes as soon as it sees session.closed
       if (!session.wasCloseRequested && c.stream) {
         // OpenAI dropped the session (expired, connection_lost, server error) while the callee is still connected.
         // Twilio would keep the leg up until TimeLimit with dead air; hang up now and finalize.
@@ -314,11 +325,12 @@ export class OpenAiLiveProvider implements PhoneProvider {
   /**
    * Hangup sequence (idempotent; the first trigger wins, later ones only refine end_reason):
    *   goodbye  -> wait for the agent's goodbye audio to start (<= goodbyeStartWaitMs) and finish (goodbyeQuietMs of silence)
-   *   done     -> mute callee audio so the model cannot start another turn; if no report_outcome yet, give the backend a
-   *               short window (longer when a delegation is already in flight)
+   *   done     -> mute callee audio so the model cannot start another turn
    *   playout  -> Twilio `mark` echo confirms the goodbye actually played (not just left our socket)
-   *   hangup   -> Twilio hangup + local finalize
-   * Returns when the call is over or the close was cancelled by a barge-in.
+   *   hangup   -> Twilio hangup: the callee's call is over here, ~goodbyeQuietMs + playout after the last goodbye audio
+   *   collect  -> (callee already gone) if no report_outcome was recorded, keep the OpenAI session open a moment for the
+   *               backend to deliver it, then finalize the record and close the session
+   * Returns when the record is final or the close was cancelled by a barge-in.
    */
   private closeCall(c: LiveCall, trigger: CloseTrigger, reason: string): Promise<void> {
     if (trigger === "end_call") c.raw.end_reason = reason;
@@ -341,17 +353,19 @@ export class OpenAiLiveProvider implements PhoneProvider {
     log.info("openai_live.closing", { task_id: c.task_id, trigger: closing.trigger, reason, outcome_recorded: !!c.outcome });
 
     // Stage "goodbye": one short farewell may play; a substantive callee interruption cancels (see cancelCloseOnBargeIn).
-    if (s && t.goodbyeStartWaitMs > 0 && closing.trigger !== "human_farewell") {
+    // After a callee goodbye + agent silence there is nothing to wait for unless the agent is speaking right now.
+    if (s && t.goodbyeStartWaitMs > 0) {
       s.closingStage = "goodbye";
+      const startWait = closing.trigger === "human_farewell" ? 0 : t.goodbyeStartWaitMs;
       let spoke = s.lastAgentAudioAtMs > 0 && t0 - s.lastAgentAudioAtMs < t.goodbyeQuietMs;
       for (;;) {
-        await sleep(poll);
         if (c.ended_at || closing.cancelled) return;
         const n = this.now();
         if (s.lastAgentAudioAtMs >= t0) spoke = true;
         if (spoke && n - s.lastAgentAudioAtMs >= t.goodbyeQuietMs) break;
-        if (!spoke && n - t0 >= t.goodbyeStartWaitMs) break;
+        if (!spoke && n - t0 >= startWait) break;
         if (n - t0 >= t.goodbyeMaxMs) break;
+        await sleep(poll);
       }
       if (closing.trigger === "agent_farewell" && !s.agentIsClosing()) {
         // Early match on a sentence that turned out not to be a goodbye ("...before we say goodbye, which day?").
@@ -366,14 +380,6 @@ export class OpenAiLiveProvider implements PhoneProvider {
     // Stage "done": the goodbye has been said. Nothing else may be spoken; no more callee audio reaches the model.
     if (s) { s.closingStage = "done"; s.muteInput(); }
     c.raw.goodbye_done_ms = this.now() - t0;
-    if (s && closing.trigger !== "end_call" && !c.outcome) {
-      const tb = this.now();
-      while (!c.outcome && !c.ended_at) {
-        await sleep(poll);
-        if (this.now() - tb >= (s.hasDelegationInFlight ? t.delegationWaitMs : t.outcomeWaitMs)) break;
-      }
-    }
-    if (c.ended_at) return;
 
     // Stage "playout": our socket being quiet is not the callee having heard it; Twilio echoes the mark after playback.
     if (c.stream && t.playoutWaitMs > 0) {
@@ -387,8 +393,30 @@ export class OpenAiLiveProvider implements PhoneProvider {
       c.marks.delete(name);
     }
     if (c.ended_at) return;
-    c.raw.close_ms = this.now() - t0;
-    await this.hangupNow(c, "completed", null);
+
+    // Stage "hangup": the callee's call ends here. Nothing below adds to what they hear.
+    c.hangup_at = this.now();
+    c.raw.hangup_at = new Date(c.hangup_at).toISOString();
+    c.raw.close_ms = c.hangup_at - t0;
+    log.info("openai_live.hangup", { task_id: c.task_id, trigger: closing.trigger, close_ms: c.raw.close_ms, tail_after_goodbye_ms: c.hangup_at - t0 - (c.raw.goodbye_done_ms as number) + t.goodbyeQuietMs, outcome_recorded: !!c.outcome });
+    await this.twilio.hangup(c.twilio_sid).catch((e) => log.warn("twilio.hangup_failed", { error: String(e) }));
+    if (c.ended_at) return;
+
+    // Stage "collect": with the callee gone, give the backend a moment to deliver report_outcome (longer if it is
+    // already working on it) so the structured result is not lost when the live model closed on its own.
+    if (s && !c.outcome && !s.closed) {
+      c.collecting = true;
+      const tb = this.now();
+      try {
+        while (!c.outcome && !c.ended_at && !s.closed) {
+          if (this.now() - tb >= (s.hasDelegationInFlight ? t.delegationWaitMs : t.outcomeWaitMs)) break;
+          await sleep(poll);
+        }
+        c.raw.collect_ms = this.now() - tb;
+        if (!c.outcome) log.info("openai_live.collect_timeout", { task_id: c.task_id, delegation_in_flight: s.hasDelegationInFlight });
+      } finally { c.collecting = false; }
+    }
+    this.end(c, "completed", null);
   }
 
   /**
@@ -464,14 +492,14 @@ export class OpenAiLiveProvider implements PhoneProvider {
   async getOutcome(call_id: string): Promise<ProviderCallOutcome> {
     const c = this.calls.get(call_id);
     if (!c) throw new Error(`openai_live: unknown call ${call_id}`);
-    if (!c.ended_at) {
+    if (!c.ended_at && !c.collecting) {
       const quiet = this.now() - c.last_status_at > config.twilio.reconcileAfterMs;
       const overMax = this.now() - c.started_at > (c.input.max_duration_seconds + 60) * 1000;
       if (c.session?.closed || quiet || overMax) await this.reconcile(c);
     }
     const ended = !!c.ended_at;
     const twilioDuration = typeof c.raw.twilio_duration === "number" ? (c.raw.twilio_duration as number) : null;
-    const duration = ended && twilioDuration != null ? twilioDuration : c.answered_at ? Math.round(((c.ended_at ?? this.now()) - c.answered_at) / 1000) : null;
+    const duration = ended && twilioDuration != null ? twilioDuration : c.answered_at ? Math.round(((c.hangup_at ?? c.ended_at ?? this.now()) - c.answered_at) / 1000) : null;
     const turns = this.turnsOf(c);
     const transcript = turns.map((t) => `${t.speaker}: ${t.text}`).join("\n");
     const usage = c.session?.usageSeconds ?? null;
@@ -497,7 +525,7 @@ export class OpenAiLiveProvider implements PhoneProvider {
   async cancelCall(call_id: string) {
     const c = this.calls.get(call_id);
     if (!c) return { cancelled: false, message: "unknown call" };
-    if (c.ended_at) return { cancelled: false, message: "already ended" };
+    if (c.ended_at || c.hangup_at) return { cancelled: false, message: "already ended" };
     const r = await this.twilio.hangup(c.twilio_sid);
     if (r.ok) this.end(c, "cancelled", "cancelled");
     return { cancelled: r.ok };

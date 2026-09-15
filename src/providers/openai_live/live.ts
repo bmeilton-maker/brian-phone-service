@@ -120,7 +120,7 @@ const TURN_FLUSH_MS = 1200;
 const TURN_GAP_MS = 1500;
 const TURN_OVERLAP_TOLERANCE_MS = 300;
 const AGENT_SILENCE_GAP_MS = 500;
-const DEFAULT_FAREWELL_SILENCE_MS = 4000;
+const DEFAULT_FAREWELL_SILENCE_MS = 2500;
 
 export class OpenAiLiveSession extends EventEmitter {
   readonly turns: TranscriptTurn[] = [];
@@ -438,17 +438,19 @@ export class OpenAiLiveSession extends EventEmitter {
 
   private armFarewellSilence() {
     if (this.farewellTimer || this.closingStage !== "none") return;
-    const limit = this.opts.farewellSilenceMs ?? DEFAULT_FAREWELL_SILENCE_MS;
+    const base = this.opts.farewellSilenceMs ?? DEFAULT_FAREWELL_SILENCE_MS;
     const check = () => {
       this.farewellTimer = null;
       if (!this.humanFarewellAt || this.closed || this.closingStage !== "none") return;
       const quietSince = Math.max(this.humanFarewellAt, this.lastAgentAudioAt);
+      // A delegation in flight means the agent is fetching its closing line; allow one backend round trip more.
+      const limit = this.delegations.size > 0 ? base * 2 : base;
       const remaining = limit - (this.now() - quietSince);
       if (remaining > 0) { this.farewellTimer = setTimeout(check, Math.max(10, remaining)); this.farewellTimer.unref?.(); return; }
       log.info("openai_live.farewell_silence", { session_id: this.sessionId, silence_ms: this.now() - quietSince });
       this.emit("farewell_silence");
     };
-    this.farewellTimer = setTimeout(check, Math.max(10, limit));
+    this.farewellTimer = setTimeout(check, Math.max(10, base));
     this.farewellTimer.unref?.();
   }
 

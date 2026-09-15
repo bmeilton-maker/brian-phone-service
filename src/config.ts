@@ -67,13 +67,13 @@ export const config = {
     /**
      * Hangup sequence: after end_call / a goodbye, wait at most this long for the agent's goodbye audio to START (it
      * must cover one backend round trip when end_call arrives before the goodbye is spoken); once speaking, the goodbye
-     * is allowed to finish. 0 = hang up immediately (tests).
+     * is allowed to finish and the line drops ~0.5 s + Twilio playout after its last word. 0 = hang up immediately (tests).
      */
-    hangupDelayMs: num("OPENAI_LIVE_HANGUP_DELAY_MS", 4000),
+    hangupDelayMs: num("OPENAI_LIVE_HANGUP_DELAY_MS", 3000),
     /** Hang up on farewell intent (agent goodbye sentence, or callee goodbye + agent silence), not only on end_call. */
     farewellHangup: env("OPENAI_LIVE_FAREWELL_HANGUP", "true").toLowerCase() !== "false",
-    /** After the callee says goodbye, hang up once the agent has been silent this long (its own goodbye ends the call sooner). */
-    farewellSilenceMs: num("OPENAI_LIVE_FAREWELL_SILENCE_MS", 4000),
+    /** After the callee says goodbye, hang up once the agent has been silent this long (doubled while a backend delegation is in flight; the agent's own goodbye ends the call sooner). */
+    farewellSilenceMs: num("OPENAI_LIVE_FAREWELL_SILENCE_MS", 2500),
     /**
      * Send Twilio `clear` (drop the agent audio still queued at Twilio) when the callee interrupts with something
      * substantive (not "mm-hm"/"okay"). GPT-Live stops generating on its own; this stops the already-buffered tail.
