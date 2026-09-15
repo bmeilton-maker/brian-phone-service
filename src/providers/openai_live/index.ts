@@ -355,7 +355,7 @@ export class OpenAiLiveProvider implements PhoneProvider {
       if (closing.trigger === "agent_farewell" && !s.agentIsClosing()) {
         // Early match on a sentence that turned out not to be a goodbye ("...before we say goodbye, which day?").
         log.info("openai_live.close_abandoned", { task_id: c.task_id, last_agent_text: s.currentAssistantText().slice(-120) });
-        s.closingStage = "none";
+        s.resetClosing();
         c.closing = null;
         return;
       }
@@ -390,15 +390,18 @@ export class OpenAiLiveProvider implements PhoneProvider {
     await this.hangupNow(c, "completed", null);
   }
 
-  /** Callee barge-in while the goodbye is still playing: they have more to say, so the conversation continues. */
+  /**
+   * Callee barge-in while the goodbye is still playing: they have more to say, so the conversation continues. Only
+   * when farewell detection is on: that is what closes the call again afterwards (the backend never repeats end_call).
+   */
   private cancelCloseOnBargeIn(c: LiveCall) {
     const s = c.session;
-    if (!c.closing || c.closing.cancelled || !s || s.closingStage !== "goodbye") return;
+    if (!config.openaiLive.farewellHangup || !c.closing || c.closing.cancelled || !s || s.closingStage !== "goodbye") return;
     if (c.closeCancels >= this.timing.maxCancels) { log.info("openai_live.close_firm", { task_id: c.task_id, cancels: c.closeCancels }); return; }
     c.closeCancels++;
     c.closing.cancelled = true;
     c.closing = null;
-    s.closingStage = "none";
+    s.resetClosing();
     c.raw.close_cancels = c.closeCancels;
     log.info("openai_live.close_cancelled", { task_id: c.task_id, cancels: c.closeCancels, note: "callee kept talking during the goodbye" });
   }

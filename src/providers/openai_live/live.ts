@@ -150,6 +150,7 @@ export class OpenAiLiveSession extends EventEmitter {
   private assistantFarewellFlagged = false;
   private humanFarewellAt = 0;
   private farewellTimer: NodeJS.Timeout | null = null;
+  private bargeInSent = false;
   private buffers: Record<"human" | "assistant", { text: string; startedAt: number; lastEndMs: number; timer: NodeJS.Timeout | null }> = {
     human: { text: "", startedAt: 0, lastEndMs: -1, timer: null },
     assistant: { text: "", startedAt: 0, lastEndMs: -1, timer: null },
@@ -200,6 +201,9 @@ export class OpenAiLiveSession extends EventEmitter {
   /** Stop forwarding the callee's audio: the goodbye has played and the line is about to drop. */
   muteInput(): void { this.inputMuted = true; }
 
+  /** The bridge cancelled or abandoned a close: back to normal; the agent's next goodbye may start a new one. */
+  resetClosing(): void { this.closingStage = "none"; this.assistantFarewellFlagged = false; }
+
   /** True while we requested session.close ourselves (as opposed to OpenAI dropping the socket). */
   get wasCloseRequested(): boolean { return this.closeRequested; }
   /** Wall-clock (opts.now) of the last agent audio delta; 0 before the agent has spoken. */
@@ -228,6 +232,9 @@ export class OpenAiLiveSession extends EventEmitter {
     if (!this.started) { this.closeRequested = true; this.ws?.close(); return; }
     this.send({ type: "session.close", event_id: "session_close" });
     this.closeRequested = true;
+    // The conversation is over; the buffered tail (usually the goodbye) belongs in the transcript now, not only once
+    // session.closed arrives.
+    this.flushAll();
     this.closeTimer = setTimeout(() => { this.closeTimer = null; if (!this.closed) { log.warn("openai_live.close_timeout", { session_id: this.sessionId }); this.ws?.close(); } }, 5000);
     this.closeTimer.unref?.();
   }
@@ -285,6 +292,7 @@ export class OpenAiLiveSession extends EventEmitter {
           // record the gap as an approximate turn latency (transcript arrival lags audio slightly).
           if (this.lastHumanTranscriptAt > this.agentTurnStartedAt && t - this.lastHumanTranscriptAt < 15_000) this.latency.turn_latencies_ms.push(t - this.lastHumanTranscriptAt);
           this.agentTurnStartedAt = t;
+          this.bargeInSent = false;
         }
         this.lastAgentAudioAt = t;
         this.greeted = true;
@@ -300,8 +308,6 @@ export class OpenAiLiveSession extends EventEmitter {
           if (this.greetingTimer) { clearTimeout(this.greetingTimer); this.greetingTimer = null; }
           this.emit("human_speech");
         }
-        // Barge-in signal for the bridge: human talking while agent audio was flowing recently.
-        if (t - this.lastAgentAudioAt < AGENT_SILENCE_GAP_MS && this.buffers.human.text === "") this.emit("barge_in");
         this.bufferTranscript("human", String(ev.delta ?? ""), ev.start_ms, ev.end_ms);
         this.onHumanText(this.buffers.human.text, t);
         break;
@@ -411,6 +417,9 @@ export class OpenAiLiveSession extends EventEmitter {
   private onHumanText(runningText: string, t: number) {
     const kind: HumanUtteranceKind = classifyHumanUtterance(runningText);
     this.emit("human_utterance", runningText, kind);
+    // Barge-in for the bridge: the person says something with content while agent audio is still flowing. Backchannels
+    // ("mm-hm", "okay") are not interruptions. Once per stretch of agent speech.
+    if (kind === "substantive" && !this.bargeInSent && t - this.lastAgentAudioAt < AGENT_SILENCE_GAP_MS) { this.bargeInSent = true; this.emit("barge_in"); }
     if (this.opts.farewellDetection === false) return;
     if (kind === "farewell") {
       if (!this.humanFarewellAt) log.info("openai_live.farewell", { session_id: this.sessionId, speaker: "human", text: runningText.slice(-120) });
