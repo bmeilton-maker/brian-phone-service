@@ -64,8 +64,16 @@ export const config = {
     wsUrl: env("OPENAI_LIVE_WS_URL", "wss://api.openai.com/v1/live/sessions"),
     /** After the callee picks up, stay silent this long waiting for their hello before the agent opens anyway. */
     greetingWaitMs: num("OPENAI_LIVE_GREETING_WAIT_MS", 3000),
-    /** After end_call, wait for the agent's goodbye audio to drain before Twilio hangs up (max). */
-    hangupDelayMs: num("OPENAI_LIVE_HANGUP_DELAY_MS", 2500),
+    /**
+     * Hangup sequence: after end_call / a goodbye, wait at most this long for the agent's goodbye audio to START (it
+     * must cover one backend round trip when end_call arrives before the goodbye is spoken); once speaking, the goodbye
+     * is allowed to finish. 0 = hang up immediately (tests).
+     */
+    hangupDelayMs: num("OPENAI_LIVE_HANGUP_DELAY_MS", 4000),
+    /** Hang up on farewell intent (agent goodbye sentence, or callee goodbye + agent silence), not only on end_call. */
+    farewellHangup: env("OPENAI_LIVE_FAREWELL_HANGUP", "true").toLowerCase() !== "false",
+    /** After the callee says goodbye, hang up once the agent has been silent this long (its own goodbye ends the call sooner). */
+    farewellSilenceMs: num("OPENAI_LIVE_FAREWELL_SILENCE_MS", 4000),
     /** Send Twilio `clear` (drop queued agent audio) as soon as the human starts talking. GPT-Live already stops itself; this only trims Twilio's playout buffer. */
     clearOnBargeIn: env("OPENAI_LIVE_CLEAR_ON_BARGE_IN", "false").toLowerCase() === "true",
     /** session.store=true keeps a 30-day recording at OpenAI (must be enabled on the project). */
