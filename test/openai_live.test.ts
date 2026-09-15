@@ -161,7 +161,7 @@ test("openai_live end-to-end (faked): dial -> media stream -> session.start -> a
   const start = JSON.parse(ws.sent[0]);
   assert.equal(start.type, "session.start");
   assert.equal(start.session.model, "gpt-live-1");
-  assert.deepEqual(start.session.audio, { format: { type: "audio/pcmu", rate: 8000 }, output: { voice: "marin" } });
+  assert.deepEqual(start.session.audio, { format: { type: "audio/pcmu", rate: 8000 }, output: { voice: "willow" } }, "default voice is willow");
   assert.match(start.session.instructions, /Riverside Dental/);
   assert.match(start.session.instructions, /Purpose of this call: Book cleaning/);
   assert.match(start.session.instructions, /Say nothing until the person who answered has spoken/);

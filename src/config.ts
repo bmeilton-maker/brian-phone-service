@@ -53,8 +53,8 @@ export const config = {
   openaiLive: {
     apiKey: env("OPENAI_API_KEY"),
     model: env("OPENAI_LIVE_MODEL", "gpt-live-1"),
-    /** GPT-Live voice (default marin). Others: gleam, meridian, quartz, ripple, vesper, willow, stone, delta, cinder ... */
-    voice: env("OPENAI_LIVE_VOICE", "marin"),
+    /** GPT-Live voice. Brian's pick is willow; others: marin (OpenAI default), gleam, meridian, quartz, ripple, vesper, stone, delta, cinder ... */
+    voice: env("OPENAI_LIVE_VOICE", "willow"),
     /** Responses-delegation backend that runs report_outcome / ask_owner / end_call. Docs: start with gpt-5.6-terra; gpt-5.6-luna is cheaper. */
     backendModel: env("OPENAI_LIVE_BACKEND_MODEL", "gpt-5.6-terra"),
     /** Optional `reasoning.effort` for the backend model (e.g. low). Unset = model default. */
