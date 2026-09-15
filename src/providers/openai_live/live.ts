@@ -9,6 +9,12 @@ import type { TranscriptTurn } from "../../types.js";
 /**
  * One OpenAI GPT-Live session (model gpt-live-1) bridged to a Twilio Media Stream.
  *
+ * Two layers, per OpenAI's GPT-Live guides: the live model only conducts the conversation (short prompt from
+ * buildLiveInstructions: role, style, when to delegate); the Responses backend holds the full envelope, authority,
+ * required outputs and the tools (report_outcome / ask_owner / end_call / note_hold). This process owns permissions,
+ * the needs_user hold, hangup and the durable call record; backend results are checked for staleness before they
+ * are fed back to the live model.
+ *
  * Verified against developers.openai.com (Sept 2026: WebSockets, Managing sessions, Delegation and tools, Telephony):
  *   connect  wss://api.openai.com/v1/live/sessions   Authorization: Bearer OPENAI_API_KEY, User-Agent
  *   ->  session.start { session: { model, instructions, audio:{format:{type:"audio/pcmu",rate:8000}, output:{voice}}, delegation } }
@@ -40,45 +46,21 @@ export function backendTools(ownerName: string) {
   ];
 }
 
-/** GPT-Live-specific addendum appended to the shared envelope prompt (live model only). */
-export function liveConversationAddendum(ownerName: string): string {
-  return `
-GPT-LIVE CONVERSATION POLICY
-Backchannel policy: Use light backchannels. Acknowledge naturally without competing with the other person.
-Interruption policy: Stop speaking when the other person interrupts. Listen to what they say.
-Opening: Say nothing until the person who answered has spoken. Then open in one short sentence and pause.
-
-Delegation policy:
-Backend tools:
-- Record the call outcome for ${ownerName} (report_outcome).
-- Ask ${ownerName} a question and wait for the answer (ask_owner).
-- Hang up the call (end_call).
-- Note that you are on hold (note_hold).
-
-Delegate to the backend when:
-- The objective is complete or clearly cannot proceed, so the outcome must be recorded and the call ended.
-- You need ${ownerName}'s decision on something the preferences or authority do not settle (say "Let me check with ${ownerName}, one moment" first).
-- You have said goodbye and the call should end.
-- You have been placed on hold.
-
-Do not delegate to the backend when:
-- You can answer from the context above or from what was already said on the call.
-- You only need a brief clarification from the person.
-
-Whenever the instructions above say to "call" a tool, delegate to the backend instead; you do not call tools yourself. Never claim a booking, payment, or commitment is done unless it was confirmed on the call.`;
-}
-
-/** Backend (Responses) prompt: the same envelope plus tool procedure. */
+/**
+ * Backend (Responses delegation) prompt addendum. The backend gets the FULL envelope from buildAgentInstructions
+ * (objective, context, authority, required outputs, tool note) plus this: how to serve the live model.
+ */
 export function backendInstructionsAddendum(ownerName: string): string {
   return `
 VOICE CONVERSATION CONTEXT
-You are the back office for the assistant speaking on a live phone call for ${ownerName}. You receive the conversation so far and requests delegated by the voice model; transcripts can contain mistakes and corrections. Use the latest confirmed information.
+You are the back office for the voice assistant speaking on a live phone call for ${ownerName}. The voice model handles the conversation and delegates to you; you receive the conversation so far. Transcripts can contain mistakes, unfinished phrases and later corrections: use the latest confirmed information. Reply with one or two short sentences the assistant can say aloud.
 
 WHAT TO DO
-- When asked to record the outcome or end the call: call report_outcome with everything learned on the call (status success only if the objective and required outputs were achieved without any unauthorized commitment), then call end_call with the matching reason. Reply with one short sentence the assistant can say.
-- When ${ownerName}'s decision is needed: call ask_owner with a crisp question and the options. Return the answer in one short sentence the assistant can relay. If the answer is NO_ANSWER, tell the assistant to take the best callback number and any reference number, thank them, and end the call.
-- When told the assistant is on hold: call note_hold.
-- Never invent facts, confirmation numbers, or commitments. Keep replies to one or two spoken sentences.`;
+- Authority question (may the assistant agree to something, or disclose something): answer from AUTHORITY above in one sentence. Anything not listed as YES is NO; then the assistant must say it needs to check with ${ownerName}.
+- ${ownerName}'s decision needed: call ask_owner with a crisp question and the options, then relay the answer in one sentence. If the answer is NO_ANSWER, tell the assistant to take the best callback number and any reference number, thank the person and end the call.
+- Record the outcome / end the call (objective done, cannot proceed, voicemail left, wrong number, goodbye said): call report_outcome with everything learned (status success only if the objective and required outputs were achieved without any unauthorized commitment), then call end_call with the matching reason.
+- On hold: call note_hold.
+- Stale or repeated requests: if the person changed or withdrew a request, act on the latest one and ignore the earlier result. Never repeat report_outcome or end_call once they have been called. Never invent facts, confirmation numbers or commitments.`;
 }
 
 export interface LiveHooks {
@@ -205,10 +187,10 @@ export class OpenAiLiveSession extends EventEmitter {
   close(): void {
     if (this.closed) return;
     if (this.closeRequested) return;
-    this.closeRequested = true;
     if (this.greetingTimer) { clearTimeout(this.greetingTimer); this.greetingTimer = null; }
-    if (!this.started) { this.ws?.close(); return; }
+    if (!this.started) { this.closeRequested = true; this.ws?.close(); return; }
     this.send({ type: "session.close", event_id: "session_close" });
+    this.closeRequested = true;
     this.closeTimer = setTimeout(() => { this.closeTimer = null; if (!this.closed) { log.warn("openai_live.close_timeout", { session_id: this.sessionId }); this.ws?.close(); } }, 5000);
     this.closeTimer.unref?.();
   }
@@ -220,7 +202,11 @@ export class OpenAiLiveSession extends EventEmitter {
     this.greetingTimer = this.closeTimer = null;
   }
 
-  private send(msg: Record<string, unknown>) { this.ws?.send(JSON.stringify(msg)); }
+  private send(msg: Record<string, unknown>) {
+    // After session.close only the close itself may go out; the docs reject further commands anyway.
+    if (this.closed || (this.closeRequested && msg.type !== "session.close")) return;
+    this.ws?.send(JSON.stringify(msg));
+  }
 
   /** Greeting policy: silence on pickup; if nobody says hello within greetingWaitMs, open anyway. */
   private armGreetingWait() {
@@ -406,6 +392,9 @@ export class OpenAiLiveSession extends EventEmitter {
     } catch (e) {
       output = { error: String(e) };
     }
+    // Interrupted speech does not cancel backend work, and a hold for the owner can outlive the call. A result that
+    // arrives after the session started closing is stale: keep it in the transcript, do not feed it back.
+    if (this.closed || this.closeRequested) { log.info("openai_live.stale_tool_result", { session_id: this.sessionId, tool: name }); this.emit("stale_result", name, args); return; }
     this.sendToolOutput(callId, output);
     this.send({ type: "response.create", event_id: `continue_${randomUUID()}` });
   }

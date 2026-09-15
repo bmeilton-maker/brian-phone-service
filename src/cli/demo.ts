@@ -11,9 +11,9 @@ import { join } from "node:path";
 import { MockProvider, SCENARIOS, type ScenarioName } from "../providers/mock.js";
 import { PhoneService } from "../service.js";
 import { CallStore } from "../store.js";
-import { buildEnvelope, buildAgentInstructions } from "../envelope.js";
+import { buildEnvelope, buildAgentInstructions, buildLiveInstructions } from "../envelope.js";
 import { XaiRealtimeSession, TOOL_NAMES } from "../providers/xai/realtime.js";
-import { OpenAiLiveSession, LIVE_TOOL_NAMES, backendInstructionsAddendum, liveConversationAddendum } from "../providers/openai_live/live.js";
+import { OpenAiLiveSession, LIVE_TOOL_NAMES, backendInstructionsAddendum } from "../providers/openai_live/live.js";
 import { FakeWs } from "../providers/xai/fakews.js";
 import { config } from "../config.js";
 import type { MakeCallRequest } from "../types.js";
@@ -52,11 +52,10 @@ if (arg === "xai-session") {
 if (arg === "openai-live-session") {
   (config.openaiLive as { apiKey: string }).apiKey ||= "demo-key";
   const env = buildEnvelope(req);
-  const base = { recipient_name: req.recipient_name, realtime_hold_supported: true, hold_seconds: 45 };
   const ws = new FakeWs();
   const session = new OpenAiLiveSession({
-    instructions: buildAgentInstructions(env, base) + "\n" + liveConversationAddendum("Brian"),
-    backendInstructions: buildAgentInstructions(env, { ...base, tools: [...LIVE_TOOL_NAMES] }) + "\n" + backendInstructionsAddendum("Brian"),
+    instructions: buildLiveInstructions(env, { recipient_name: req.recipient_name }),
+    backendInstructions: buildAgentInstructions(env, { recipient_name: req.recipient_name, realtime_hold_supported: true, hold_seconds: 45, tools: [...LIVE_TOOL_NAMES] }) + "\n" + backendInstructionsAddendum("Brian"),
     ownerName: "Brian", voice: "marin", wsFactory: () => ws, greetingWaitMs: 50,
     hooks: { onAskOwner: async (q) => { console.log(`\n[needs Brian] ${q}\n[auto-answer for demo] Tuesday`); return "Tuesday"; }, onEndCall: async (r) => console.log(`[hangup] reason=${r}`) },
   });
@@ -66,7 +65,8 @@ if (arg === "openai-live-session") {
   ws.emit("open");
   const start = JSON.parse(ws.sent[0]);
   console.log("--- client -> OpenAI:", start.type, JSON.stringify({ model: start.session.model, audio: start.session.audio, delegation: { type: start.session.delegation.type, backend: start.session.delegation.responses.model, tools: start.session.delegation.responses.tools.map((t: { name: string }) => t.name) } }));
-  console.log("--- session.instructions preview:\n" + start.session.instructions.slice(0, 600) + "\n...");
+  console.log(`--- live session.instructions (${start.session.instructions.length} chars, conversation only):\n` + start.session.instructions + "\n");
+  console.log(`--- backend delegation.responses.instructions: ${start.session.delegation.responses.instructions.length} chars (full envelope + authority + tools)\n`);
   await session.handle(JSON.stringify({ type: "session.started", session: { id: "live_demo" } }));
   await session.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "Riverside Dental, this is Maria.", start_ms: 900, end_ms: 2100 }));
   await session.handle(JSON.stringify({ type: "session.output_transcript.delta", delta: "Hi, this is Brian's AI assistant. I'd like to schedule a dental cleaning for Brian.", start_ms: 2600, end_ms: 5200 }));

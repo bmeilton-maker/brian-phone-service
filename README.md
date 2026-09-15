@@ -22,7 +22,7 @@ Grok Chief of Staff -> phone MCP tools -> PhoneService -> { BlandProvider | XaiP
 ```bash
 cp .env.example .env         # fill in BLAND_API_KEY at minimum
 npm install
-npm test                     # mocked regression suite (48 tests)
+npm test                     # mocked regression suite (51 tests)
 npm run demo                 # mock scheduling call, envelope -> result
 npm run demo -- needs_user   # human-in-the-loop flow
 npm run demo -- xai-session  # envelope -> xAI session.update -> tool calls -> structured outcome, no network
@@ -131,9 +131,9 @@ Outbound path (xAI SIP is inbound-first; there is no documented "dial this PSTN 
 `src/providers/openai_live/`. Runbook with the chosen path, what is verified, and what to confirm on the first live call: **docs/OPENAI_LIVE_RUNBOOK.md**.
 
 1. `POST /Calls.json` `To={callee}` with inline TwiML `<Connect><Stream url="wss://PUBLIC/webhooks/openai-live/media"><Parameter name="task_id"/></Stream></Connect>`, async AMD, status callbacks on `/webhooks/openai-live/twilio/*`. One leg; our call_id = Twilio CallSid.
-2. Callee answers -> Twilio opens the Media Stream to us -> we open `wss://api.openai.com/v1/live/sessions`, send `session.start` (envelope as instructions + GPT-Live conversation/delegation policy, `audio/pcmu` 8 kHz, Responses delegation with our tools) and relay mu-law both ways unchanged.
+2. Callee answers -> Twilio opens the Media Stream to us -> we open `wss://api.openai.com/v1/live/sessions`, send `session.start` (`audio/pcmu` 8 kHz, Responses delegation) and relay mu-law both ways unchanged. Two prompt layers per OpenAI's GPT-Live guides: the live model gets a short conversation prompt (`buildLiveInstructions`: role, style, Brian's phone prefs, goal, the facts it needs, a `Delegation policy`); the backend model gets the full `buildAgentInstructions` envelope (authority, required outputs) plus the tool schemas.
 3. Greeting hold: GPT-Live waits for the human natively; if nobody speaks for `OPENAI_LIVE_GREETING_WAIT_MS` we prompt it to open (`session.instructions.append` + `session.commentary.append`). Turn-taking and interruptions are handled by the full-duplex model (no VAD knobs).
-4. Tools arrive as `response.event -> response.output_item.done (function_call)`; we answer with `response.item.create` + `response.create`. `end_call` lets the goodbye drain, hangs up via Twilio and finalizes locally. `ask_owner` holds for Brian (`needs_user`).
+4. Tools arrive as `response.event -> response.output_item.done (function_call)`; this service executes them (it owns permissions and state) and answers with `response.item.create` + `response.create`. `end_call` lets the goodbye drain, hangs up via Twilio and finalizes locally. `ask_owner` holds for Brian (`needs_user`). Results that arrive after the session started closing are marked stale and not fed back.
 5. Twilio `completed`, stream stop, `session.closed`, or a quiet-callback reconcile finalizes. `raw_provider_result.latency` records setup, first-audio, per-turn and delegation latencies for the A/B against xAI.
 
 Trial: `"provider": "openai_live"` per call (`examples/make_call_openai_live_override.json`), or `PHONE_PROVIDER=openai_live` process-wide. xAI and Bland stay available.
@@ -169,7 +169,7 @@ Every call is persisted as `data/calls/<task_id>.json` with `request`, `envelope
 
 ## Testing
 
-* `npm test`: 48 mocked tests covering the 10 brief scenarios, error cases, idempotency, persistence, Bland API shape, xAI webhook signing, xAI session/tool flow, GPT-Live session/media relay/delegated tools/greeting hold, needs_user hold and timeout, cancel, provider override, HTTP webhook + WebSocket routing.
+* `npm test`: 51 mocked tests covering the 10 brief scenarios, error cases, idempotency, persistence, Bland API shape, xAI webhook signing, xAI session/tool flow, GPT-Live session/media relay/delegated tools/greeting hold, needs_user hold and timeout, cancel, provider override, HTTP webhook + WebSocket routing.
 * `npm run demo -- <scenario>`: any mock scenario end to end.
 * Live PSTN tests are manual: **docs/SIDE_BY_SIDE_CHECKLIST.md**.
 
@@ -181,7 +181,7 @@ Implement `PhoneProvider` (`src/types.ts`: `startCall`, `getOutcome`, `cancelCal
 
 ```
 src/types.ts            envelope, result, provider interface
-src/envelope.ts         envelope + one prompt builder for all providers
+src/envelope.ts         envelope + one prompt builder for all providers (+ short GPT-Live conversation prompt)
 src/extraction.ts       transcript -> normalized result
 src/service.ts          PhoneService (idempotency, polling, needs_user, persistence)
 src/store.ts            file-backed call history with redaction

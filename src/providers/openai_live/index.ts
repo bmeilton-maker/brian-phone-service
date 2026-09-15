@@ -1,9 +1,9 @@
 import { config } from "../../config.js";
-import { buildAgentInstructions } from "../../envelope.js";
+import { buildAgentInstructions, buildLiveInstructions } from "../../envelope.js";
 import { log } from "../../logger.js";
 import type { CallState, PhoneProvider, ProviderCallOutcome, StartCallInput, StartCallResult, TranscriptTurn } from "../../types.js";
 import { TwilioClient } from "../xai/twilio.js";
-import { OpenAiLiveSession, LIVE_TOOL_NAMES, backendInstructionsAddendum, liveConversationAddendum, type LiveWsLike } from "./live.js";
+import { OpenAiLiveSession, LIVE_TOOL_NAMES, backendInstructionsAddendum, type LiveWsLike } from "./live.js";
 
 /**
  * OpenAiLiveProvider: outbound via Twilio Programmable Voice + Media Streams -> OpenAI GPT-Live (gpt-live-1).
@@ -220,9 +220,9 @@ export class OpenAiLiveProvider implements PhoneProvider {
 
   private openSession(c: LiveCall) {
     const owner = c.input.envelope.identity.owner_name;
-    const base = { recipient_name: c.input.recipient_name, opening_instruction: c.input.opening_instruction, realtime_hold_supported: true, hold_seconds: config.needsUserHoldSeconds };
-    const instructions = buildAgentInstructions(c.input.envelope, base) + "\n" + liveConversationAddendum(owner);
-    const backendInstructions = buildAgentInstructions(c.input.envelope, { ...base, tools: [...LIVE_TOOL_NAMES] }) + "\n" + backendInstructionsAddendum(owner);
+    // Two layers: short conversation prompt for the live model; full envelope + authority + tools for the backend.
+    const instructions = buildLiveInstructions(c.input.envelope, { recipient_name: c.input.recipient_name, opening_instruction: c.input.opening_instruction });
+    const backendInstructions = buildAgentInstructions(c.input.envelope, { recipient_name: c.input.recipient_name, opening_instruction: c.input.opening_instruction, realtime_hold_supported: true, hold_seconds: config.needsUserHoldSeconds, tools: [...LIVE_TOOL_NAMES] }) + "\n" + backendInstructionsAddendum(owner);
     const session = new OpenAiLiveSession({
       instructions, backendInstructions, ownerName: owner, voice: c.input.preferred_voice ?? config.openaiLive.voice,
       wsFactory: this.deps.wsFactory, greetingWaitMs: config.openaiLive.greetingWaitMs, now: this.now,
@@ -245,6 +245,7 @@ export class OpenAiLiveProvider implements PhoneProvider {
     session.on("started", (id: string | null) => { c.raw.openai_session_id = id; });
     session.on("greeting_fallback", () => { c.raw.greeting_fallback = true; log.info("openai_live.greeting_fallback", { task_id: c.task_id, note: "callee did not speak after pickup; agent opened" }); });
     session.on("error", (e: Error) => { c.raw.live_error = String(e); });
+    session.on("stale_result", (tool: string) => { c.raw.stale_results = [...((c.raw.stale_results as string[] | undefined) ?? []), tool]; });
     session.on("closed", (info: { session_reason: string | null }) => {
       c.raw.live_close_reason = info.session_reason;
       if (c.ended_at) return;
@@ -275,8 +276,10 @@ export class OpenAiLiveProvider implements PhoneProvider {
   private holdForOwner(c: LiveCall, question: string, options?: string[]): Promise<string | null> {
     return new Promise((resolve) => {
       const id = `q_${this.now()}`;
-      const timer = setTimeout(() => { if (c.pendingQuestion?.id === id) { c.pendingQuestion = null; c.state = "in_progress"; resolve(null); } }, config.needsUserHoldSeconds * 1000);
-      c.pendingQuestion = { id, question, options, asked_at: new Date(this.now()).toISOString(), resolve: (a) => { clearTimeout(timer); c.pendingQuestion = null; c.state = "in_progress"; resolve(a); } };
+      // Leaving needs_user must not overwrite a final state if the call ended while holding.
+      const release = () => { c.pendingQuestion = null; if (!c.ended_at) c.state = "in_progress"; };
+      const timer = setTimeout(() => { if (c.pendingQuestion?.id === id) { release(); resolve(null); } }, config.needsUserHoldSeconds * 1000);
+      c.pendingQuestion = { id, question, options, asked_at: new Date(this.now()).toISOString(), resolve: (a) => { clearTimeout(timer); release(); resolve(a); } };
       c.state = "needs_user";
       log.info("openai_live.needs_user", { task_id: c.task_id, question, options, hold_seconds: config.needsUserHoldSeconds });
     });

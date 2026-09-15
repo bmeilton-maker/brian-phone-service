@@ -111,8 +111,7 @@ test("openai_live end-to-end (faked): dial -> media stream -> session.start -> a
   assert.equal(start.session.model, "gpt-live-1");
   assert.deepEqual(start.session.audio, { format: { type: "audio/pcmu", rate: 8000 }, output: { voice: "marin" } });
   assert.match(start.session.instructions, /Riverside Dental/);
-  assert.match(start.session.instructions, /Book cleaning/);
-  assert.match(start.session.instructions, /Delegation policy/);
+  assert.match(start.session.instructions, /Goal: Book cleaning/);
   assert.match(start.session.instructions, /Say nothing until the person who answered has spoken/);
   assert.equal(start.session.delegation.type, "responses");
   assert.equal(start.session.delegation.responses.model, "gpt-5.6-terra");
@@ -192,6 +191,65 @@ test("openai_live end-to-end (faked): dial -> media stream -> session.start -> a
   assert.equal(typeof latency.first_agent_audio_ms, "number");
   assert.equal(latency.turn_latencies_ms.length, 1, "one human->agent turn gap measured");
   assert.equal(latency.delegation_roundtrips_ms.length, 1);
+});
+
+test("two layers: live prompt is short and conversation-only; backend prompt carries the full envelope, authority and tools", async () => {
+  const { p, ws } = await answeredCall();
+  const s = JSON.parse(ws.sent[0]).session;
+  const live: string = s.instructions;
+  const backend: string = s.delegation.responses.instructions;
+  // live: OpenAI's live-prompting template sections, Brian's phone prefs, and the conversational facts it needs
+  for (const re of [/^You are Brian's AI assistant/, /Backchannel policy: Use moderate backchannels/, /Interruption policy: Stop speaking when the other person interrupts/, /Delegation policy:\nBackend tools:/, /Delegate to the backend when:/, /Do not delegate to the backend when:/, /Never say a booking, payment, cancellation or commitment is done unless the backend confirmed it/, /Opening: Say nothing until the person who answered has spoken\. Then open in one short sentence .* and pause/, /Find out before ending: appointment date/, /You may agree to: schedule a new appointment, reschedule\./]) assert.match(live, re);
+  assert.ok(live.length < 3500, `live prompt should stay small (got ${live.length} chars)`);
+  // live: no tool names, schemas or the long authority / tools sections
+  for (const re of [/report_outcome/, /ask_owner/, /end_call/, /note_hold/, /\nAUTHORITY\n/, /\nTOOLS\n/, /json/i]) assert.doesNotMatch(live, re);
+  // backend: everything heavy
+  for (const re of [/\nOBJECTIVE\n/, /\nREQUIRED OUTPUTS/, /\nAUTHORITY\n/, /Authorize spending: NO amount is pre-approved/, /\nTOOLS\n/, /report_outcome/, /ask_owner/, /end_call/, /note_hold/, /VOICE CONVERSATION CONTEXT/, /Never repeat report_outcome or end_call/]) assert.match(backend, re);
+  assert.doesNotMatch(backend, /send_dtmf/, "backend is told it has no DTMF, not to use send_dtmf");
+  assert.match(backend, /cannot press phone-menu digits/);
+  // tool schemas live in delegation.responses.tools, not in any prompt
+  assert.ok(s.delegation.responses.tools.find((t: { name: string }) => t.name === "report_outcome").parameters.properties.confirmation_numbers);
+  void p;
+});
+
+test("opening_instruction and authority/disclosure flow into the live prompt", async () => {
+  const { p, ws } = makeProvider();
+  const env = buildEnvelope({ recipient_name: "Clinic", phone_number: "+16145550100", objective: "Cancel Brian's Friday visit", required_outputs: [], authority: { may_cancel: true, may_authorize_amount_up_to: 50, may_disclose: ["date of birth"] } });
+  await p.startCall({ ...input(), envelope: env, recipient_name: "Clinic", opening_instruction: "Ask for the front desk." });
+  const media = new FakeMediaWs();
+  p.attachMediaStream(media);
+  media.twilio({ event: "start", start: { streamSid: "MZ1", callSid: "CA900", customParameters: { task_id: "task_l1" } } });
+  ws.emit("open");
+  const live: string = JSON.parse(ws.sent[0]).session.instructions;
+  assert.match(live, /You may agree to: schedule a new appointment, reschedule, cancel, authorize spending up to \$50\./);
+  assert.match(live, /You may share about Brian: first name, date of birth; nothing else personal\./);
+  assert.match(live, /Opening guidance: Ask for the front desk\./);
+  assert.match(live, /Find out before ending: \(nothing specific\)/);
+});
+
+test("stale backend results after the call ends are recorded but not fed back to the live model", async () => {
+  const { p, ws, tw } = await answeredCall();
+  const sess = session(p);
+  await sess.handle(JSON.stringify({ type: "session.started", session: { id: "live_stale" } }));
+  // Brian is being asked; meanwhile the callee hangs up and Twilio reports completed.
+  const pending = sess.handle(JSON.stringify({ type: "response.event", delegation_id: "item_q", event: { type: "response.output_item.done", item: { type: "function_call", status: "completed", call_id: "q9", name: "ask_owner", arguments: JSON.stringify({ question: "Tue or Wed?" }) } } }));
+  await sleep(5);
+  assert.equal((await p.getOutcome("CA900")).state, "needs_user");
+  p.handleTwilioStatus({ CallSid: "CA900", CallStatus: "completed", CallDuration: "12" });
+  await pending; // the hold is released with no answer when the call ends
+  const after = ws.sent.map((m) => JSON.parse(m).type);
+  assert.ok(after.includes("session.close"));
+  assert.ok(!after.includes("response.item.create"), "no tool output sent into a closing session");
+  assert.ok(!after.includes("response.create"));
+  const out = await p.getOutcome("CA900");
+  assert.equal(out.state, "completed");
+  assert.deepEqual(out.raw.stale_results, ["ask_owner"]);
+  assert.match(out.transcript, /\[owner did not answer in time\]/);
+  assert.equal(tw.hangups(), 0, "call already over; nothing to hang up");
+  // a late end_call from the backend is harmless too
+  await sess.handle(JSON.stringify({ type: "response.event", delegation_id: "item_e", event: { type: "response.output_item.done", item: { type: "function_call", status: "completed", call_id: "e9", name: "end_call", arguments: JSON.stringify({ reason: "other" }) } } }));
+  assert.equal(tw.hangups(), 1, "end_call hook still runs hangup (idempotent on Twilio's side)");
+  assert.equal((await p.getOutcome("CA900")).duration_seconds, 12, "already-ended call keeps its Twilio duration");
 });
 
 test("greeting hold: silent pickup opens after OPENAI_LIVE_GREETING_WAIT_MS via instructions.append + commentary.append, once", async () => {
