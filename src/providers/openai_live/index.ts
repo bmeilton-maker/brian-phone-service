@@ -282,7 +282,7 @@ export class OpenAiLiveProvider implements PhoneProvider {
     const session = new OpenAiLiveSession({
       instructions, backendInstructions, ownerName: owner, voice: c.input.preferred_voice ?? config.openaiLive.voice,
       wsFactory: this.deps.wsFactory, greetingWaitMs: config.openaiLive.greetingWaitMs, now: this.now,
-      openingLine: c.input.opening_instruction ?? `Hi, this is ${owner}'s AI assistant calling on his behalf.`,
+      openingLine: c.input.opening_instruction,
       farewellDetection: config.openaiLive.farewellHangup, farewellSilenceMs: config.openaiLive.farewellSilenceMs,
       hooks: {
         onAskOwner: (question, options) => this.holdForOwner(c, question, options),

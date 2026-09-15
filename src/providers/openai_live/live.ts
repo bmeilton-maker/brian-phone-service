@@ -103,7 +103,7 @@ export interface LiveSessionOptions {
   hooks: LiveHooks;
   wsFactory?: (url: string, headers: Record<string, string>) => LiveWsLike;
   greetingWaitMs?: number;
-  /** Text spoken if the callee picks up and says nothing (greeting fallback). */
+  /** Opening guidance used if the callee picks up and says nothing (greeting fallback); default is a purpose-first line. */
   openingLine?: string;
   /** Emit `farewell` / `farewell_silence` so the bridge can hang up on goodbye. Default true. */
   farewellDetection?: boolean;
@@ -261,9 +261,11 @@ export class OpenAiLiveSession extends EventEmitter {
       if (this.humanSpoke || this.greeted || this.closed) return;
       this.greeted = true;
       this.latency.greeting_fallback = true;
-      const opening = this.opts.openingLine ?? `Hi, this is ${this.opts.ownerName}'s AI assistant.`;
+      const opening = this.opts.openingLine
+        ? `follow this opening guidance: ${this.opts.openingLine}`
+        : `one short purpose-first sentence ("Hi, I'm calling for ${this.opts.ownerName} about ..."); do not introduce yourself as an AI or assistant unless asked`;
       this.send({ type: "session.instructions.append", event_id: "greeting_fallback", delegation_id: null,
-        content: `The person has picked up but has not said anything. Speak first now, in English: say "${opening}" in one short sentence, then pause and listen for their reply.` });
+        content: `The person has picked up but has not said anything. Speak first now, in English: ${opening}, then pause and listen for their reply.` });
       this.send({ type: "session.commentary.append", event_id: "greeting_fallback_go", delegation_id: null, content: "Begin the conversation now, following the instructions provided." });
       this.emit("greeting_fallback");
     }, this.opts.greetingWaitMs ?? 3000);
