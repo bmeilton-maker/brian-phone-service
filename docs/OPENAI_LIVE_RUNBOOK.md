@@ -53,7 +53,7 @@ Verdict for a latency trial: Media Streams. If the tunnel adds audible delay, th
 | Default behavior: GPT-Live waits for the user unless told to greet | verified (docs only describe explicit greeting) |
 | Close: `session.close` -> `session.closed { reason, usage.seconds }`; `session.usage.updated` snapshots | verified |
 | Pricing: $0.05/min voice layer, billed per second; backend tokens separate | verified (launch post) |
-| Voices: `marin` default; `gleam`, `meridian`, `quartz`, `ripple`, `vesper`, `willow`, `stone`, `delta`, `cinder`, ... | verified |
+| Voices: `willow` (our default), `marin` (OpenAI default), `gleam`, `meridian`, `quartz`, `ripple`, `vesper`, `stone`, `delta`, `cinder`, ... | verified |
 | Live prompt template: short role/style, `Backchannel policy`, `Interruption policy`, `Delegation policy` with `Backend tools` / `Delegate to the backend when` / `Do not delegate to the backend when`; "Delegate before giving an answer that depends on backend work. Do not guess the result while waiting." | verified (live-prompting), applied in `buildLiveInstructions` |
 | Twilio Agent Connect `GPTLiveProvider` = Python SDK over the same Media Streams bridge; outbound via `initiate_outbound_conversation` | verified (Twilio post), not used (Node service) |
 | Twilio: `POST /Calls.json` with inline `Twiml=<Connect><Stream>`, `<Parameter>` custom params, `MachineDetection=Enable AsyncAmd=true AsyncAmdStatusCallback`, `Timeout`, `TimeLimit` | verified (Twilio docs / tutorial) |
@@ -65,7 +65,7 @@ Verdict for a latency trial: Media Streams. If the tunnel adds audible delay, th
 PHONE_PROVIDER=xai                # leave as is; flip per call first (see below)
 OPENAI_API_KEY=sk-...             # project key with gpt-live-1 + backend model access
 OPENAI_LIVE_MODEL=gpt-live-1
-OPENAI_LIVE_VOICE=marin
+OPENAI_LIVE_VOICE=willow
 OPENAI_LIVE_BACKEND_MODEL=gpt-5.6-terra      # docs: start here; gpt-5.6-luna is cheaper
 OPENAI_LIVE_BACKEND_REASONING_EFFORT=        # optional, e.g. low
 OPENAI_LIVE_BACKEND_SERVICE_TIER=            # optional, priority = Fast mode if enabled on the project
@@ -78,7 +78,7 @@ OPENAI_LIVE_STORE=false
 # reused: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, PUBLIC_BASE_URL, NEEDS_USER_HOLD_SECONDS
 ```
 
-Voice: default `marin` (OpenAI's default, neutral). Override process-wide with `OPENAI_LIVE_VOICE` or per call with `preferred_voice` in `phone_make_call` (e.g. `gleam` / `meridian` for a North American feminine / masculine voice). The voice is fixed at session start. `OPENAI_API_KEY` is read only in this process (`session.start` over the server WebSocket); it is never sent to Twilio or written to call records.
+Voice: default `willow` (Brian's pick after the trial; `gleam` was used for the latency trial, `marin` is OpenAI's neutral default). Override process-wide with `OPENAI_LIVE_VOICE` or per call with `preferred_voice` in `phone_make_call` (e.g. `gleam` / `meridian` for a North American feminine / masculine voice). The voice is fixed at session start. `OPENAI_API_KEY` is read only in this process (`session.start` over the server WebSocket); it is never sent to Twilio or written to call records.
 
 Preflight (`OpenAiLiveProvider.preflight`) needs `OPENAI_API_KEY`, the three Twilio vars and `PUBLIC_BASE_URL`. Otherwise the service logs `openai_live.not_configured` and runs without it. No xAI vars are required for `openai_live`; if `XAI_API_KEY` is absent, post-call extraction falls back to `report_outcome` + heuristics (the xAI text model is only used when its key exists).
 

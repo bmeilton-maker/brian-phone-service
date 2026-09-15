@@ -7,6 +7,6 @@
   "authority": { "may_schedule": false, "may_reschedule": false },
   "required_outputs": ["price", "earliest availability", "how long it takes"],
   "provider": "openai_live",
-  "preferred_voice": "marin",
+  "preferred_voice": "willow",
   "max_duration_seconds": 300
 }

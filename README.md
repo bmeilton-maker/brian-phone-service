@@ -87,7 +87,7 @@ Extraction order: provider structured outcome (xAI `report_outcome` tool call) >
 | `XAI_EXTRACTION_MODEL` | `grok-4-fast` | Text model for transcript -> result. |
 | `XAI_SIP_NUMBER`, `XAI_WEBHOOK_SECRET` | | From registering a Direct SIP number (see docs/PROVISIONING.md). |
 | `OPENAI_API_KEY` | | Required for the openai_live provider. |
-| `OPENAI_LIVE_MODEL`, `OPENAI_LIVE_VOICE` | `gpt-live-1`, `marin` | Live voice model and voice. |
+| `OPENAI_LIVE_MODEL`, `OPENAI_LIVE_VOICE` | `gpt-live-1`, `willow` | Live voice model and voice (per-call `preferred_voice` overrides). |
 | `OPENAI_LIVE_BACKEND_MODEL` | `gpt-5.6-terra` | Responses-delegation backend that runs the tools (`gpt-5.6-luna` is cheaper). Optional `OPENAI_LIVE_BACKEND_REASONING_EFFORT`, `OPENAI_LIVE_BACKEND_SERVICE_TIER`. |
 | `OPENAI_LIVE_GREETING_WAIT_MS`, `OPENAI_LIVE_HANGUP_DELAY_MS`, `OPENAI_LIVE_CLEAR_ON_BARGE_IN`, `OPENAI_LIVE_STORE` | `3000`, `3000`, `true`, `false` | Greeting hold, max wait for the goodbye to start before hangup, Twilio buffer clear on a substantive barge-in, keep a recording at OpenAI. |
 | `OPENAI_LIVE_FAREWELL_HANGUP`, `OPENAI_LIVE_FAREWELL_SILENCE_MS` | `true`, `2500` | Hang up on farewell intent (agent goodbye sentence; callee goodbye + agent silence), not only on `end_call`. |
