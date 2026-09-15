@@ -111,7 +111,7 @@ test("openai_live end-to-end (faked): dial -> media stream -> session.start -> a
   assert.equal(start.session.model, "gpt-live-1");
   assert.deepEqual(start.session.audio, { format: { type: "audio/pcmu", rate: 8000 }, output: { voice: "marin" } });
   assert.match(start.session.instructions, /Riverside Dental/);
-  assert.match(start.session.instructions, /Goal: Book cleaning/);
+  assert.match(start.session.instructions, /Purpose of this call: Book cleaning/);
   assert.match(start.session.instructions, /Say nothing until the person who answered has spoken/);
   assert.equal(start.session.delegation.type, "responses");
   assert.equal(start.session.delegation.responses.model, "gpt-5.6-terra");
@@ -199,12 +199,16 @@ test("two layers: live prompt is short and conversation-only; backend prompt car
   const live: string = s.instructions;
   const backend: string = s.delegation.responses.instructions;
   // live: OpenAI's live-prompting template sections, Brian's phone prefs, and the conversational facts it needs
-  for (const re of [/^You are Brian's AI assistant/, /Backchannel policy: Use moderate backchannels/, /Interruption policy: Stop speaking when the other person interrupts/, /Delegation policy:\nBackend tools:/, /Delegate to the backend when:/, /Do not delegate to the backend when:/, /Never say a booking, payment, cancellation or commitment is done unless the backend confirmed it/, /Opening: Say nothing until the person who answered has spoken\. Then open in one short sentence .* and pause/, /Find out before ending: appointment date/, /You may agree to: schedule a new appointment, reschedule\./]) assert.match(live, re);
-  assert.ok(live.length < 3500, `live prompt should stay small (got ${live.length} chars)`);
-  // live: no tool names, schemas or the long authority / tools sections
-  for (const re of [/report_outcome/, /ask_owner/, /end_call/, /note_hold/, /\nAUTHORITY\n/, /\nTOOLS\n/, /json/i]) assert.doesNotMatch(live, re);
+  for (const re of [/^You are calling Riverside Dental on behalf of Brian\. Speak warmly and naturally, short sentences, unhurried but not slow\./, /busy or frustrated, acknowledge briefly/, /Purpose of this call: Book cleaning/,
+    /Backchannel policy: Use moderate backchannels\. Acknowledge naturally without competing with the main response\./, /Interruption policy: Stop speaking when the user interrupts\. Listen to what they say\./,
+    /Delegation policy:\nBackend tools:\n- Call outcome reporting and ending the call/, /Delegate to the backend when:\n- You need to record the final outcome or hang up/, /A correction changes work already requested/, /Do not delegate to the backend when:\n- Greetings, small talk, or repeating a still-current result/,
+    /Delegate before giving an answer that depends on backend work\.\nDo not guess the result while waiting\.\nDo not promise a booking, price, or completed action before the backend confirms\./,
+    /Opening: Say nothing until the person who answered has spoken\. Then open in one short sentence .* and pause/]) assert.match(live, re);
+  assert.ok(live.length < 2500, `live prompt should stay small (got ${live.length} chars)`);
+  // live: no tool names, schemas, envelope sections, required outputs, preferences or authority tables
+  for (const re of [/report_outcome/, /ask_owner/, /end_call/, /note_hold/, /\nAUTHORITY\n/, /\nTOOLS\n/, /REQUIRED OUTPUTS/, /appointment date/, /PREFERENCES/, /You may agree to/, /json/i]) assert.doesNotMatch(live, re);
   // backend: everything heavy
-  for (const re of [/\nOBJECTIVE\n/, /\nREQUIRED OUTPUTS/, /\nAUTHORITY\n/, /Authorize spending: NO amount is pre-approved/, /\nTOOLS\n/, /report_outcome/, /ask_owner/, /end_call/, /note_hold/, /VOICE CONVERSATION CONTEXT/, /Never repeat report_outcome or end_call/]) assert.match(backend, re);
+  for (const re of [/\nOBJECTIVE\n/, /\nREQUIRED OUTPUTS/, /- appointment date/, /\nAUTHORITY\n/, /Authorize spending: NO amount is pre-approved/, /\nTOOLS\n/, /report_outcome/, /ask_owner/, /end_call/, /note_hold/, /VOICE CONVERSATION CONTEXT/, /Fact, preference or choice question/, /Never repeat report_outcome or end_call/]) assert.match(backend, re);
   assert.doesNotMatch(backend, /send_dtmf/, "backend is told it has no DTMF, not to use send_dtmf");
   assert.match(backend, /cannot press phone-menu digits/);
   // tool schemas live in delegation.responses.tools, not in any prompt
@@ -212,19 +216,22 @@ test("two layers: live prompt is short and conversation-only; backend prompt car
   void p;
 });
 
-test("opening_instruction and authority/disclosure flow into the live prompt", async () => {
+test("opening_instruction reaches the live prompt; authority, context and preferences reach only the backend", async () => {
   const { p, ws } = makeProvider();
-  const env = buildEnvelope({ recipient_name: "Clinic", phone_number: "+16145550100", objective: "Cancel Brian's Friday visit", required_outputs: [], authority: { may_cancel: true, may_authorize_amount_up_to: 50, may_disclose: ["date of birth"] } });
+  const env = buildEnvelope({ recipient_name: "Clinic", phone_number: "+16145550100", objective: "Cancel Brian's Friday visit", required_outputs: [], authority: { may_cancel: true, may_authorize_amount_up_to: 50, may_disclose: ["date of birth"] }, relevant_context: { dob: "1980-01-02" }, preferences: { time_of_day: "mornings" } });
   await p.startCall({ ...input(), envelope: env, recipient_name: "Clinic", opening_instruction: "Ask for the front desk." });
   const media = new FakeMediaWs();
   p.attachMediaStream(media);
   media.twilio({ event: "start", start: { streamSid: "MZ1", callSid: "CA900", customParameters: { task_id: "task_l1" } } });
   ws.emit("open");
-  const live: string = JSON.parse(ws.sent[0]).session.instructions;
-  assert.match(live, /You may agree to: schedule a new appointment, reschedule, cancel, authorize spending up to \$50\./);
-  assert.match(live, /You may share about Brian: first name, date of birth; nothing else personal\./);
+  const s = JSON.parse(ws.sent[0]).session;
+  const live: string = s.instructions;
+  const backend: string = s.delegation.responses.instructions;
+  assert.match(live, /You are calling Clinic on behalf of Brian/);
+  assert.match(live, /Purpose of this call: Cancel Brian's Friday visit/);
   assert.match(live, /Opening guidance: Ask for the front desk\./);
-  assert.match(live, /Find out before ending: \(nothing specific\)/);
+  for (const re of [/1980-01-02/, /mornings/, /date of birth/, /\$50/]) assert.doesNotMatch(live, re);
+  for (const re of [/- dob: 1980-01-02/, /- time_of_day: mornings/, /Cancel an appointment or service: YES/, /Authorize spending: up to \$50 total/, /You may disclose only these personal details if asked: date of birth/]) assert.match(backend, re);
 });
 
 test("stale backend results after the call ends are recorded but not fed back to the live model", async () => {
