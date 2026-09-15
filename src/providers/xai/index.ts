@@ -217,8 +217,10 @@ export class XaiProvider implements PhoneProvider {
   private holdForOwner(c: XaiCall, question: string, options?: string[]): Promise<string | null> {
     return new Promise((resolve) => {
       const id = `q_${this.now()}`;
-      const timer = setTimeout(() => { if (c.pendingQuestion?.id === id) { c.pendingQuestion = null; c.state = "in_progress"; resolve(null); } }, config.needsUserHoldSeconds * 1000);
-      c.pendingQuestion = { id, question, options, asked_at: new Date(this.now()).toISOString(), resolve: (a) => { clearTimeout(timer); c.pendingQuestion = null; c.state = "in_progress"; resolve(a); } };
+      // Leaving needs_user must not overwrite a final state if the call ended while holding.
+      const release = () => { c.pendingQuestion = null; if (!c.ended_at) c.state = "in_progress"; };
+      const timer = setTimeout(() => { if (c.pendingQuestion?.id === id) { release(); resolve(null); } }, config.needsUserHoldSeconds * 1000);
+      c.pendingQuestion = { id, question, options, asked_at: new Date(this.now()).toISOString(), resolve: (a) => { clearTimeout(timer); release(); resolve(a); } };
       c.state = "needs_user";
       log.info("xai.needs_user", { task_id: c.task_id, question, options, hold_seconds: config.needsUserHoldSeconds });
     });

@@ -1,0 +1,12 @@
+{
+  "recipient_name": "Worthington Auto Service",
+  "phone_number": "+16145550101",
+  "objective": "Get the price and earliest availability for a synthetic oil change on a 2019 Honda Odyssey. Do not book; just gather information.",
+  "relevant_context": { "vehicle": "2019 Honda Odyssey", "mileage": "about 78,000" },
+  "preferences": { "days": "weekday afternoons" },
+  "authority": { "may_schedule": false, "may_reschedule": false },
+  "required_outputs": ["price", "earliest availability", "how long it takes"],
+  "provider": "openai_live",
+  "preferred_voice": "marin",
+  "max_duration_seconds": 300
+}

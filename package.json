@@ -2,7 +2,7 @@
   "name": "brian-phone-service",
   "version": "0.1.0",
   "private": true,
-  "description": "Outbound phone-calling service for Brian's AI chief of staff (Grok/Ring). Provider-abstracted: Bland (default) and xAI Grok Voice.",
+  "description": "Outbound phone-calling service for Brian's AI chief of staff (Grok/Ring). Provider-abstracted: Bland (default), xAI Grok Voice, OpenAI GPT-Live-1.",
   "type": "module",
   "engines": { "node": ">=22" },
   "scripts": {
