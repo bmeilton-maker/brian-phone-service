@@ -17,7 +17,7 @@
   "follow_up": null,
   "questions_for_brian": [],
   "duration_seconds": 140,
-  "transcript": "assistant: Hi, this is Brian's AI assistant...\nhuman: ...",
+  "transcript": "assistant: Hi — calling about Brian's dental cleaning...\nhuman: ...",
   "recording_reference": "https://.../recording.mp3",
   "provider": "bland",
   "raw_provider_result": { "provider": "bland", "call_id": "..." }

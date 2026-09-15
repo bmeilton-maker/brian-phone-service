@@ -26,14 +26,14 @@ const S = (text: string): TranscriptTurn => ({ speaker: "system", text });
 export const SCENARIOS: Record<ScenarioName, Scenario> = {
   info_request: {
     human_answered: true, voicemail: false, error: null, duration: 95,
-    turns: [A("Hi, this is Brian's AI assistant calling on his behalf. I'm checking whether you have availability for a standard oil change this week and what it costs."),
+    turns: [A("Hi — calling about a standard oil change for Brian. I'm checking whether you have availability this week and what it costs."),
       H("Sure. Standard synthetic is $79.99 and we have openings Thursday and Friday afternoons."),
       A("Great, so $79.99 and Thursday or Friday afternoon. Thanks, I'll pass that along. Goodbye.")],
     provider_extraction: { status: "success", results: { price: "$79.99", availability: "Thursday or Friday afternoon" }, summary: "Synthetic oil change is $79.99; openings Thursday and Friday afternoons." },
   },
   scheduling: {
     human_answered: true, voicemail: false, error: null, duration: 140,
-    turns: [A("Hi, this is Brian's AI assistant. I'd like to schedule a dental cleaning for Brian."),
+    turns: [A("Hi — I'd like to schedule a dental cleaning for Brian."),
       H("We have Tuesday at 10 AM or Wednesday at 2 PM."),
       A("Tuesday at 10 AM works. Can you confirm that and give me a confirmation number?"),
       H("Booked. Tuesday at 10 AM, confirmation number DC-48213."),
@@ -42,7 +42,7 @@ export const SCENARIOS: Record<ScenarioName, Scenario> = {
   },
   harmless_question: {
     human_answered: true, voicemail: false, error: null, duration: 110,
-    turns: [A("Hi, this is Brian's AI assistant calling to confirm his Friday appointment."),
+    turns: [A("Hi — calling to confirm Brian's Friday appointment."),
       H("Wait, am I talking to a robot?"),
       A("Yes, I'm an AI assistant calling on Brian's behalf. Happy to continue or Brian can call back."),
       H("That's fine. Friday at 3 is confirmed."),
@@ -52,7 +52,7 @@ export const SCENARIOS: Record<ScenarioName, Scenario> = {
   needs_user: {
     human_answered: true, voicemail: false, error: null, duration: 160,
     needs_user: { question: "Only 8 AM Monday or 4 PM Friday are open this week. Which does Brian prefer, or wait for next week?", options: ["Monday 8 AM", "Friday 4 PM", "Wait"] },
-    turns: [A("Hi, this is Brian's AI assistant calling to schedule a furnace inspection."),
+    turns: [A("Hi — calling to schedule a furnace inspection for Brian."),
       H("This week I only have Monday 8 AM or Friday 4 PM."),
       A("Let me check with Brian, one moment."),
       S("[hold: no answer within window]"),
@@ -68,31 +68,31 @@ export const SCENARIOS: Record<ScenarioName, Scenario> = {
   ivr: {
     human_answered: true, voicemail: false, error: null, duration: 210,
     turns: [S("[IVR] For appointments press 1, for billing press 2."), S("[dtmf 1]"), S("[IVR] Please hold for the next representative."),
-      H("Appointments, how can I help?"), A("Hi, this is Brian's AI assistant. I'd like to confirm his appointment on the 14th."),
+      H("Appointments, how can I help?"), A("Hi — I'd like to confirm Brian's appointment on the 14th."),
       H("Confirmed, 9 AM on the 14th."), A("9 AM on the 14th, confirmed. Thanks, goodbye.")],
     provider_extraction: { status: "success", dates_and_times: ["the 14th 9:00 AM"], summary: "Navigated IVR (pressed 1), reached appointments, confirmed 9 AM on the 14th." },
   },
   hold: {
     human_answered: true, voicemail: false, error: null, duration: 480,
     turns: [H("Please hold."), S("[hold 6 min]"), H("Thanks for holding. How can I help?"),
-      A("Hi, this is Brian's AI assistant checking the status of order 77812."), H("It shipped today, arrives Thursday."),
+      A("Hi — calling about the status of order 77812."), H("It shipped today, arrives Thursday."),
       A("Shipped today, arriving Thursday. Thanks, goodbye.")],
     provider_extraction: { status: "success", results: { "order status": "shipped today, arrives Thursday" }, summary: "After a 6 minute hold, confirmed order 77812 shipped today and arrives Thursday." },
   },
   interruptions: {
     human_answered: true, voicemail: false, error: null, duration: 120,
-    turns: [A("Hi, this is Brian's AI assistant calling to—"), H("Who?"), A("Brian Meilton's AI assistant."), H("What about?"),
+    turns: [A("Hi — calling about Brian Meilton's—"), H("Who?"), A("I'm calling for Brian Meilton."), H("What about?"),
       A("Rescheduling his Thursday appointment."), H("Hold on— okay, what day?"), A("Any morning next week."), H("Tuesday 9."),
       A("Tuesday at 9 AM. Confirmed, thank you.")],
     provider_extraction: { status: "success", dates_and_times: ["Tuesday 9:00 AM"], summary: "Rescheduled to Tuesday 9 AM despite repeated interruptions." },
   },
   call_drop: {
     human_answered: true, voicemail: false, error: "call_dropped", duration: 40,
-    turns: [A("Hi, this is Brian's AI assistant."), H("Hi, one sec—"), S("[call disconnected]")],
+    turns: [A("Hi — calling about Brian's appointment."), H("Hi, one sec—"), S("[call disconnected]")],
   },
   cannot_complete: {
     human_answered: true, voicemail: false, error: null, duration: 90,
-    turns: [A("Hi, this is Brian's AI assistant. I'd like to cancel Brian's membership."),
+    turns: [A("Hi — I'd like to cancel Brian's membership."),
       H("Only the account holder can do that, in person or via the app."),
       A("Understood. I'll let Brian know. Is there a reference number for this call?"), H("No, just have him use the app."), A("Thank you, goodbye.")],
     provider_extraction: { status: "failed", summary: "Business requires the account holder to cancel in person or via the app. Not completed.", follow_up_required: true, follow_up: { action: "Cancel membership yourself via the app or in person", by_whom: "brian" } },
@@ -101,7 +101,7 @@ export const SCENARIOS: Record<ScenarioName, Scenario> = {
   invalid_number: { human_answered: false, voicemail: false, error: "invalid_number", duration: 0, turns: [], fail_start: true },
   wrong_person: {
     human_answered: true, voicemail: false, error: null, duration: 30,
-    turns: [A("Hi, this is Brian's AI assistant, is this Riverside Dental?"), H("No, wrong number."), A("Sorry about that. Goodbye.")],
+    turns: [A("Hi — calling about an appointment for Brian. Is this Riverside Dental?"), H("No, wrong number."), A("Sorry about that. Goodbye.")],
     provider_extraction: { status: "failed", human_or_business_reached: "wrong number", summary: "Wrong number; the person said it was not Riverside Dental." },
   },
   provider_error: { human_answered: false, voicemail: false, error: "provider_error", duration: 0, turns: [], fail_start: true },

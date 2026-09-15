@@ -15,7 +15,7 @@ Grok Chief of Staff -> phone MCP tools -> PhoneService -> { BlandProvider | XaiP
 * **OpenAI GPT-Live-1 provider (`openai_live`, latency trial)**: Twilio dials the callee and opens a Media Stream to this service, which relays mu-law audio to OpenAI's Live Sessions WebSocket (`gpt-live-1`). Same envelope prompt, same greeting hold, tools via Responses delegation (`report_outcome`, `ask_owner`, `end_call`, `note_hold`). Runbook: **docs/OPENAI_LIVE_RUNBOOK.md**.
 * **Mock provider**: scripted scenarios; runs the whole pipeline with no keys and no network. Used by tests, CI, and `npm run demo`.
 * **Secrets are env-only.** Never in prompts, transcripts, logs, or stored records (the store and logger redact anything key-like).
-* **Identity**: the agent always says it is Brian's AI assistant. It never claims to be Brian, never uses a cloned voice. xAI default voice is `eve`.
+* **Identity and opening**: the agent opens purpose-first ("Hi — calling about [thing].") after the callee greets, and does not lead with "I'm Brian's AI assistant". It is still an AI assistant calling for Brian: if asked, it says so plainly in one short sentence and continues. It never claims to be Brian or a human, never uses a cloned voice. xAI default voice is `eve`. (Brian's locked opening style, Sep 15 2026.)
 
 ## Quick start
 
@@ -107,7 +107,7 @@ The xai provider is registered only when every xAI/Twilio variable is present; o
 
 1. `POST https://api.bland.ai/v1/calls` with header `authorization: <BLAND_API_KEY>` and body
    `phone_number, task, first_sentence, voice, model, wait_for_greeting=true, interruptibility=3, background_track, temperature, record=true, max_duration (minutes), voicemail.action="leave_message", metadata{task_id}`.
-   `task` is the envelope rendered by `buildAgentInstructions` (same text xAI gets, minus tool notes). `first_sentence` identifies the caller as Brian's AI assistant.
+   `task` is the envelope rendered by `buildAgentInstructions` (same text xAI gets, minus tool notes). `first_sentence` is purpose-first ("Hi — I'm calling on behalf of Brian. Am I speaking with {recipient}?"); it never leads with AI identity. Pass `opening_instruction` for a call-specific purpose line.
 2. Poll `GET /v1/calls/:id` every `BLAND_POLL_INTERVAL_MS` (5 s) until `completed`.
 3. Map `status / completed / queue_status -> state`, `answered_by -> human_answered / voicemail`, `summary -> provider summary`, `transcripts[] + concatenated_transcript -> transcript`, `recording_url`, `price`, `call_length (min) -> duration_seconds`, `error_message -> error`.
 4. Cancel: `POST /v1/calls/:id/stop`.

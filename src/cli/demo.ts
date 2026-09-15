@@ -39,7 +39,7 @@ if (arg === "xai-session") {
   ws.emit("open");
   console.log("--- client -> xAI:", ws.sent.map((m) => JSON.parse(m).type).join(", "));
   console.log("--- session.instructions preview:\n" + JSON.parse(ws.sent[0]).session.instructions.slice(0, 600) + "\n...");
-  await session.handle(JSON.stringify({ type: "response.output_audio_transcript.done", transcript: "Hi, this is Brian's AI assistant calling to schedule a dental cleaning for Brian." }));
+  await session.handle(JSON.stringify({ type: "response.output_audio_transcript.done", transcript: "Hi — calling to schedule a dental cleaning for Brian." }));
   await session.handle(JSON.stringify({ type: "conversation.item.input_audio_transcription.completed", transcript: "We have Tuesday 10 AM or Wednesday 2 PM." }));
   await session.handle(JSON.stringify({ type: "response.done", response: { output: [{ type: "function_call", name: "ask_owner", call_id: "c1", arguments: JSON.stringify({ question: "Tuesday 10 AM or Wednesday 2 PM?", options: ["Tuesday 10 AM", "Wednesday 2 PM"] }) }] } }));
   await session.handle(JSON.stringify({ type: "conversation.item.input_audio_transcription.completed", transcript: "Booked Tuesday 10 AM, confirmation DC-48213." }));
@@ -69,7 +69,7 @@ if (arg === "openai-live-session") {
   console.log(`--- backend delegation.responses.instructions: ${start.session.delegation.responses.instructions.length} chars (full envelope + authority + tools)\n`);
   await session.handle(JSON.stringify({ type: "session.started", session: { id: "live_demo" } }));
   await session.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "Riverside Dental, this is Maria.", start_ms: 900, end_ms: 2100 }));
-  await session.handle(JSON.stringify({ type: "session.output_transcript.delta", delta: "Hi, this is Brian's AI assistant. I'd like to schedule a dental cleaning for Brian.", start_ms: 2600, end_ms: 5200 }));
+  await session.handle(JSON.stringify({ type: "session.output_transcript.delta", delta: "Hi — I'd like to schedule a dental cleaning for Brian.", start_ms: 2600, end_ms: 5200 }));
   await session.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "We have Tuesday 10 AM or Wednesday 2 PM.", start_ms: 6000, end_ms: 8500 }));
   await session.handle(JSON.stringify({ type: "session.delegation.created", delegation: { id: "item_d1", type: "delegation", target: "responses" }, response_id: "resp_1" }));
   await session.handle(JSON.stringify({ type: "response.event", delegation_id: "item_d1", event: { type: "response.output_item.done", item: { type: "function_call", status: "completed", call_id: "c1", name: "ask_owner", arguments: JSON.stringify({ question: "Tuesday 10 AM or Wednesday 2 PM?", options: ["Tuesday 10 AM", "Wednesday 2 PM"] }) } } }));

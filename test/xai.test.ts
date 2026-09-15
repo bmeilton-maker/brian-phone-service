@@ -103,7 +103,7 @@ test("xai end-to-end (faked): dial -> incoming webhook -> session.update with en
   await sess.handle(JSON.stringify({ type: "response.created" }));
   await sleep(40);
   assert.equal(ws.sent.filter((m) => JSON.parse(m).type === "response.create").length, 0, "xAI auto-responded to the greeting; no nudge sent");
-  await sess.handle(JSON.stringify({ type: "response.output_audio_transcript.done", transcript: "Hi, this is Brian's AI assistant." }));
+  await sess.handle(JSON.stringify({ type: "response.output_audio_transcript.done", transcript: "Hi — calling about a cleaning for Brian." }));
   await sess.handle(JSON.stringify({ type: "response.done", response: { output: [] } }));
   await sess.handle(JSON.stringify({ type: "conversation.item.input_audio_transcription.completed", transcript: "Sure, Tuesday at 10." }));
   await sess.handle(JSON.stringify({ type: "response.done", response: { output: [{ type: "function_call", name: "report_outcome", call_id: "c1", arguments: JSON.stringify({ status: "success", summary: "Booked Tuesday 10.", human_or_business_reached: "receptionist", results: { "appointment date": "Tuesday" }, commitments_made: [], financial_commitments: [], dates_and_times: ["Tuesday 10:00"], confirmation_numbers: [], follow_up_required: false, follow_up: null, questions_for_brian: [] }) }] } }));
