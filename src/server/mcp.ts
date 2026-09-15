@@ -9,10 +9,10 @@ import type { MakeCallRequest } from "../types.js";
 
 /**
  * MCP server (stdio) exposing the four phone tools plus answer_question for the needs_user flow.
- * When the xai provider is configured, the HTTP webhook listener is started alongside so Twilio/xAI can reach us.
+ * When the xai or openai_live provider is configured, the HTTP webhook listener is started alongside so Twilio/xAI/OpenAI can reach us.
  */
-const { service, xai } = createService();
-if (xai) createHttpServer(service, xai).listen(config.port, () => log.info("http.listening", { port: config.port, reason: "xai webhooks" }));
+const { service, xai, openaiLive } = createService();
+if (xai || openaiLive) createHttpServer(service, { xai, openaiLive }).listen(config.port, () => log.info("http.listening", { port: config.port, reason: "provider webhooks", xai: !!xai, openai_live: !!openaiLive }));
 
 const server = new McpServer({ name: "brian-phone-service", version: "0.1.0" });
 const ok = (v: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(v, null, 2) }] });
@@ -31,7 +31,7 @@ server.registerTool("phone_make_call", {
     recipient_name: z.string(), phone_number: z.string().describe("E.164, e.g. +16145550100"), objective: z.string(),
     relevant_context: z.record(z.string(), z.unknown()).optional(), preferences: z.record(z.string(), z.unknown()).optional(), authority,
     required_outputs: z.array(z.string()), opening_instruction: z.string().optional(), preferred_voice: z.string().optional(),
-    max_duration_seconds: z.number().int().positive().optional(), provider: z.enum(["bland", "xai", "mock"]).optional(), idempotency_key: z.string().optional(),
+    max_duration_seconds: z.number().int().positive().optional(), provider: z.enum(["bland", "xai", "openai_live", "mock"]).optional(), idempotency_key: z.string().optional(),
   },
 }, async (args) => ok(await service.makeCall(args as MakeCallRequest)));
 
@@ -41,7 +41,7 @@ server.registerTool("phone_get_result", { title: "Get normalized call result", d
   async (a) => ok(await service.getResult(a)));
 server.registerTool("phone_cancel_call", { title: "Cancel a call", description: "Hang up an active or queued call.", inputSchema: ref },
   async (a) => ok(await service.cancelCall(a)));
-server.registerTool("phone_answer_question", { title: "Answer the agent's pending question", description: "Deliver Brian's answer while the agent holds the line (xai/mock only). Use the question id from phone_get_status.pending_question.", inputSchema: { ...ref, question_id: z.string(), answer: z.string() } },
+server.registerTool("phone_answer_question", { title: "Answer the agent's pending question", description: "Deliver Brian's answer while the agent holds the line (xai/openai_live/mock). Use the question id from phone_get_status.pending_question.", inputSchema: { ...ref, question_id: z.string(), answer: z.string() } },
   async (a) => ok(await service.answerQuestion(a, a.question_id, a.answer)));
 
 const transport = new StdioServerTransport();

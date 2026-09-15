@@ -58,7 +58,7 @@ export function buildAgentInstructions(env: CallEnvelope, opt: InstructionOption
     : `If a meaningful choice comes up that the preferences above do not settle (or anything outside your authority), do not guess. Tell the person you need to confirm with ${owner}, get the best callback number and any reference number, thank them, and end the call. Note the open question clearly.`;
 
   const toolNote = opt.tools?.length
-    ? `\nTOOLS\nYou have these tools: ${opt.tools.join(", ")}. When the objective is done or the call cannot proceed, call report_outcome with everything you learned, then say goodbye and call end_call. If you reach a phone menu, use send_dtmf to press digits. If placed on hold, wait patiently and call note_hold; do not hang up unless the hold exceeds ${Math.max(opt.hold_seconds * 4, 300)} seconds.`
+    ? `\nTOOLS\nYou have these tools: ${opt.tools.join(", ")}. When the objective is done or the call cannot proceed, call report_outcome with everything you learned, then say goodbye and call end_call.${opt.tools.includes("send_dtmf") ? " If you reach a phone menu, use send_dtmf to press digits." : " You cannot press phone-menu digits on this call; if you reach a menu, wait for or ask for a representative."} If placed on hold, wait patiently and call note_hold; do not hang up unless the hold exceeds ${Math.max(opt.hold_seconds * 4, 300)} seconds.`
     : "";
 
   return `You are ${env.identity.role}, making an outbound phone call to ${opt.recipient_name} on ${owner}'s behalf.

@@ -2,7 +2,7 @@
  * Provider-independent types. Grok / Ring only ever sees these shapes.
  */
 
-export type ProviderName = "bland" | "xai" | "mock";
+export type ProviderName = "bland" | "xai" | "openai_live" | "mock";
 
 export interface Authority {
   may_schedule: boolean;

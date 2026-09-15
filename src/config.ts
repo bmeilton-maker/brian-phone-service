@@ -50,6 +50,30 @@ export const config = {
     autoResponseGraceMs: num("XAI_AUTO_RESPONSE_GRACE_MS", 800),
   },
 
+  openaiLive: {
+    apiKey: env("OPENAI_API_KEY"),
+    model: env("OPENAI_LIVE_MODEL", "gpt-live-1"),
+    /** GPT-Live voice (default marin). Others: gleam, meridian, quartz, ripple, vesper, willow, stone, delta, cinder ... */
+    voice: env("OPENAI_LIVE_VOICE", "marin"),
+    /** Responses-delegation backend that runs report_outcome / ask_owner / end_call. Docs: start with gpt-5.6-terra; gpt-5.6-luna is cheaper. */
+    backendModel: env("OPENAI_LIVE_BACKEND_MODEL", "gpt-5.6-terra"),
+    /** Optional `reasoning.effort` for the backend model (e.g. low). Unset = model default. */
+    backendReasoningEffort: env("OPENAI_LIVE_BACKEND_REASONING_EFFORT"),
+    /** Optional `service_tier` for the backend (auto | default | flex | priority). Unset = project default. */
+    backendServiceTier: env("OPENAI_LIVE_BACKEND_SERVICE_TIER"),
+    wsUrl: env("OPENAI_LIVE_WS_URL", "wss://api.openai.com/v1/live/sessions"),
+    /** After the callee picks up, stay silent this long waiting for their hello before the agent opens anyway. */
+    greetingWaitMs: num("OPENAI_LIVE_GREETING_WAIT_MS", 3000),
+    /** After end_call, wait for the agent's goodbye audio to drain before Twilio hangs up (max). */
+    hangupDelayMs: num("OPENAI_LIVE_HANGUP_DELAY_MS", 2500),
+    /** Send Twilio `clear` (drop queued agent audio) as soon as the human starts talking. GPT-Live already stops itself; this only trims Twilio's playout buffer. */
+    clearOnBargeIn: env("OPENAI_LIVE_CLEAR_ON_BARGE_IN", "false").toLowerCase() === "true",
+    /** session.store=true keeps a 30-day recording at OpenAI (must be enabled on the project). */
+    store: env("OPENAI_LIVE_STORE", "false").toLowerCase() === "true",
+    /** Twilio ring timeout (s) before no-answer. */
+    ringTimeoutSeconds: num("OPENAI_LIVE_RING_TIMEOUT_SECONDS", 40),
+  },
+
   twilio: {
     accountSid: env("TWILIO_ACCOUNT_SID"),
     authToken: env("TWILIO_AUTH_TOKEN"),
@@ -62,6 +86,6 @@ export const config = {
 };
 
 export function assertProvider(p: string): ProviderName {
-  if (p === "bland" || p === "xai" || p === "mock") return p;
-  throw new Error(`Unknown PHONE_PROVIDER "${p}" (expected bland | xai | mock)`);
+  if (p === "bland" || p === "xai" || p === "openai_live" || p === "mock") return p;
+  throw new Error(`Unknown PHONE_PROVIDER "${p}" (expected bland | xai | openai_live | mock)`);
 }

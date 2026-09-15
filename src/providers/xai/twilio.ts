@@ -56,9 +56,15 @@ export class TwilioClient {
       StatusCallbackMethod: "POST",
       Timeout: "20",
     };
+    const r = await this.createCall(form);
+    log.info("twilio.dialed", { task_id: opts.taskId, call_sid: r.sid, sip_leg: "xai", callee: opts.to });
+    return r;
+  }
+
+  /** Generic POST /Calls.json; providers build their own form (SIP-first for xAI, Media Streams for openai_live). */
+  async createCall(form: Record<string, string>) {
     const { status, json } = await this.http.form("POST", `/2010-04-01/Accounts/${config.twilio.accountSid}/Calls.json`, form);
     if (status >= 300 || !json.sid) throw new Error(`Twilio dial failed (${status}): ${String(json.message ?? JSON.stringify(json)).slice(0, 300)}`);
-    log.info("twilio.dialed", { task_id: opts.taskId, call_sid: json.sid, sip_leg: "xai", callee: opts.to });
     return { sid: String(json.sid), raw: json };
   }
 
