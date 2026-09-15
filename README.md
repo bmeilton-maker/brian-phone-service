@@ -67,7 +67,7 @@ Grok builds the envelope (`examples/call-envelope.json`); the service only ever 
 
 * Anything not explicitly `true` in `authority` is **NO**. No pre-approved spend unless `may_authorize_amount_up_to` is a number.
 * Personal details beyond the first name are disclosed only if listed in `may_disclose`.
-* When a real choice is not settled by `preferences`, the agent does not guess. xAI: it holds and asks Brian (`ask_owner`, up to `NEEDS_USER_HOLD_SECONDS`), then falls back to callback number + reference. Bland: takes callback + reference and returns `questions_for_brian`.
+* When a real choice is not settled by `preferences`, the agent does not guess. xAI / openai_live: it holds and asks Brian (`ask_owner`, up to `NEEDS_USER_HOLD_SECONDS`), then falls back to callback number + reference; on openai_live a reply that lands after the hold (chat latency) is still relayed if the call is live and the question is recent (`NEEDS_USER_LATE_ANSWER_SECONDS`). Bland: takes callback + reference and returns `questions_for_brian`.
 
 ### Normalized result
 
@@ -98,7 +98,7 @@ Extraction order: provider structured outcome (xAI `report_outcome` tool call) >
 | `PHONE_SERVICE_TOKEN` | | Bearer token for the HTTP API. |
 | `DATA_DIR` | `./data` | Call records (`data/calls/<task_id>.json`). |
 | `DEFAULT_MAX_DURATION_SECONDS` | `600` | |
-| `NEEDS_USER_HOLD_SECONDS` | `45` | How long the xAI agent waits for Brian's answer. |
+| `NEEDS_USER_HOLD_SECONDS`, `NEEDS_USER_LATE_ANSWER_SECONDS` | `60`, `180` | How long the xAI / openai_live agent holds for Brian's answer; on openai_live an answer arriving after the hold (within the late window, call still live) is still handed to the agent mid-call. |
 
 The xai provider is registered only when every xAI/Twilio variable is present; otherwise the service logs `xai.not_configured` and keeps running on Bland. Likewise `openai_live` needs `OPENAI_API_KEY` + Twilio + `PUBLIC_BASE_URL` or it logs `openai_live.not_configured`.
 

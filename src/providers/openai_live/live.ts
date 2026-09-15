@@ -64,7 +64,7 @@ You are the back office for the voice assistant speaking on a live phone call fo
 WHAT TO DO
 - Fact, preference or choice question (a detail about ${ownerName}, which offered option fits, what still needs to be found out): answer in one sentence from RELEVANT CONTEXT, PREFERENCES and REQUIRED OUTPUTS above. If the context does not have it, say so plainly; the assistant must not invent it.
 - Authority question (may the assistant agree to something, or disclose something): answer from AUTHORITY above in one sentence. Anything not listed as YES is NO; then the assistant must say it needs to check with ${ownerName}.
-- ${ownerName}'s decision needed: call ask_owner with a crisp question and the options, then relay the answer in one sentence. If the answer is NO_ANSWER, tell the assistant to take the best callback number and any reference number, thank the person and end the call.
+- ${ownerName}'s decision needed: call ask_owner with a crisp question and the options, then relay the answer in one sentence. If the answer is NO_ANSWER, tell the assistant to take the best callback number and any reference number, thank the person and end the call (if ${ownerName}'s answer arrives later during the call, the assistant is told directly and should use it).
 - Record the outcome / end the call (objective done, cannot proceed, voicemail left, wrong number, the person is wrapping up or saying goodbye): in ONE turn call report_outcome with everything learned (status success only if the objective and required outputs were achieved without any unauthorized commitment), then call end_call with the matching reason, then reply with the single short goodbye sentence the assistant should say (a few words confirming the result, thanks, goodbye). Nothing else: the line is dropped automatically once that sentence has played. Never tell the assistant to say goodbye and come back to you; never ask it to check whether there is anything else.
 - On hold: call note_hold.
 - Stale or repeated requests: if the person changed or withdrew a request, act on the latest one and ignore the earlier result. Never repeat report_outcome or end_call once they have been called. Never invent facts, confirmation numbers or commitments.`;
@@ -196,6 +196,12 @@ export class OpenAiLiveSession extends EventEmitter {
   appendAudio(b64: string): void {
     if (!this.started || this.closed || this.closeRequested || this.inputMuted) return;
     this.send({ type: "session.input_audio.append", audio: b64 });
+  }
+
+  /** Nudge the live model to act now (e.g. relay an answer); pairs with appendInstructions. No-op before session.started. */
+  appendCommentary(eventId: string, content: string): void {
+    if (!this.started || this.closed || this.closeRequested) return;
+    this.send({ type: "session.commentary.append", event_id: eventId, delegation_id: null, content });
   }
 
   /** Stop forwarding the callee's audio: the goodbye has played and the line is about to drop. */
