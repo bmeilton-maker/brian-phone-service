@@ -144,7 +144,7 @@ test("openai_live end-to-end (faked): dial -> media stream -> session.start -> a
   await sess.handle(JSON.stringify({ type: "session.output_audio.delta", delta: "Q0ND" }));
   const toTwilio = media.sent.map((m) => JSON.parse(m));
   assert.deepEqual(toTwilio[0], { event: "media", streamSid: "MZ1", media: { payload: "Q0ND" } });
-  await sess.handle(JSON.stringify({ type: "session.output_transcript.delta", delta: "Hi, this is Brian's AI assistant. ", start_ms: 2500, end_ms: 4000 }));
+  await sess.handle(JSON.stringify({ type: "session.output_transcript.delta", delta: "Hi — calling about a cleaning for Brian. ", start_ms: 2500, end_ms: 4000 }));
   await sess.handle(JSON.stringify({ type: "session.output_transcript.delta", delta: "I'd like to book a cleaning.", start_ms: 4000, end_ms: 5000 }));
   await sess.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "Sure, Tuesday at 10.", start_ms: 6000, end_ms: 7000 }));
 
@@ -184,7 +184,7 @@ test("openai_live end-to-end (faked): dial -> media stream -> session.start -> a
   assert.equal(out.cost_usd, 0.04, "voice layer at $0.05/min from session usage");
   assert.equal(out.raw.live_close_reason, "close_requested");
   assert.match(out.transcript, /^human: Riverside Dental, this is Maria\./, "fragments grouped into a human turn, first in order");
-  assert.match(out.transcript, /assistant: Hi, this is Brian's AI assistant\. I'd like to book a cleaning\./);
+  assert.match(out.transcript, /assistant: Hi — calling about a cleaning for Brian\. I'd like to book a cleaning\./);
   assert.match(out.transcript, /human: Sure, Tuesday at 10\./);
   const latency = out.raw.latency as { first_human_transcript_ms: number; first_agent_audio_ms: number; turn_latencies_ms: number[]; delegation_roundtrips_ms: number[] };
   assert.equal(typeof latency.first_human_transcript_ms, "number");
@@ -203,7 +203,11 @@ test("two layers: live prompt is short and conversation-only; backend prompt car
     /Backchannel policy: Use moderate backchannels\. Acknowledge naturally without competing with the main response\./, /Interruption policy: Stop speaking when the user interrupts\. Listen to what they say\./,
     /Delegation policy:\nBackend tools:\n- Call outcome reporting and ending the call/, /Delegate to the backend when:\n- You need to record the final outcome or hang up/, /A correction changes work already requested/, /Do not delegate to the backend when:\n- Greetings, small talk, or repeating a still-current result/,
     /Delegate before giving an answer that depends on backend work\.\nDo not guess the result while waiting\.\nDo not promise a booking, price, or completed action before the backend confirms\./,
-    /Opening: Say nothing until the person who answered has spoken\. Then open in one short sentence .* and pause/]) assert.match(live, re);
+    /Opening: Say nothing until the person who answered has spoken\. Then open with one short, purpose-only sentence .* and pause so they can respond\. Do not lead with who or what you are\./,
+    // Brian's locked opening style (Sep 15 2026): purpose-first; AI identity is disclosed only if asked
+    /You are an AI assistant calling for Brian\. Do not announce that on your own; if asked who or what you are, or whether you are an AI, say so plainly in one short sentence and continue\./]) assert.match(live, re);
+  assert.doesNotMatch(live, /who you are, one-line purpose/);
+  assert.doesNotMatch(live, /this is Brian's AI assistant/i, "the opening example must not lead with AI identity");
   assert.ok(live.length < 2500, `live prompt should stay small (got ${live.length} chars)`);
   // live: no tool names, schemas, envelope sections, required outputs, preferences or authority tables
   for (const re of [/report_outcome/, /ask_owner/, /end_call/, /note_hold/, /\nAUTHORITY\n/, /\nTOOLS\n/, /REQUIRED OUTPUTS/, /appointment date/, /PREFERENCES/, /You may agree to/, /json/i]) assert.doesNotMatch(live, re);
@@ -271,7 +275,8 @@ test("greeting hold: silent pickup opens after OPENAI_LIVE_GREETING_WAIT_MS via 
   assert.equal(types.filter((t) => t === "session.commentary.append").length, 1);
   const instr = ws.sent.map((m) => JSON.parse(m)).find((m) => m.type === "session.instructions.append");
   assert.equal(instr.delegation_id, null);
-  assert.match(instr.content, /Brian's AI assistant/);
+  assert.match(instr.content, /open with one short, purpose-only sentence about why you are calling \(do not say who or what you are\)/);
+  assert.doesNotMatch(instr.content, /AI assistant/, "silent-pickup opener is purpose-first too");
   assert.equal((await p.getOutcome("CA900")).raw.greeting_fallback, true);
   // a later human hello must not re-trigger anything
   await sess.handle(JSON.stringify({ type: "session.input_transcript.delta", delta: "Hello?", start_ms: 3000, end_ms: 3400 }));

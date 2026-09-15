@@ -17,7 +17,13 @@ test("Bland payload matches the documented POST /v1/calls shape", () => {
   assert.equal(p.wait_for_greeting, true);
   assert.match(p.task, /AI assistant calling for Brian/);
   assert.match(p.task, /Cancel an appointment or service: NO/);
-  assert.match(p.first_sentence, /Brian's AI assistant/);
+  // Brian's locked opening style: purpose-first, AI identity only if asked
+  assert.match(p.task, /open with one short, purpose-only sentence/);
+  assert.match(p.task, /Do not introduce yourself as an AI or an assistant in the opening/);
+  assert.match(p.task, /If they ask who or what you are, or whether you're an AI, answer honestly/);
+  assert.doesNotMatch(p.task, /who you are, one-line purpose/);
+  assert.equal(p.first_sentence, "Hi — I'm calling on behalf of Brian. Am I speaking with Dr. Office?");
+  assert.doesNotMatch(p.first_sentence, /AI|assistant/i);
   assert.ok(!/api[_-]?key/i.test(p.task), "no secrets in prompt");
 });
 
